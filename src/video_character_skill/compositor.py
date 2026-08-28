@@ -111,6 +111,38 @@ source silhouette): a thin outline rather than a patch. The replacement matte
 is never thresholded, the source matte is hardened only where it is *more
 confident than the replacement*, and there is still no dilation, feathering
 or inpainting; ``source_only`` pixels still come from the O1 clip.
+
+Source-removal mask (v4 POC)
+----------------------------
+Visual QA of the hardened union still showed the old person's hair around
+the replacement. A read-only morphology sweep explained why: below 128 the
+source matte's alpha is not a blending weight worth honouring. 69 % of those
+pixels sit at alpha <= 7 and 10-30 px from the silhouette (VP9 alpha
+compression haze), while the hair you can see (alpha >= 32) lies within 4 px
+(p90) of the ``alpha >= 64`` core — and blending with *any* partial source
+alpha keeps most of a strand, because the source pixel *is* the strand.
+
+v4 therefore stops treating the source matte as an alpha at all. It is a
+binary support — "the old person must not survive here" — built from
+:data:`SOURCE_REMOVAL_THRESHOLD` = 64 and a Euclidean-disk dilation of
+:data:`SOURCE_REMOVAL_DILATION_RADIUS` = 4 px::
+
+    source_core = source_alpha >= 64
+    removal = dilate_disk(source_core, 4)        # offsets with dy*dy + dx*dx <= 16
+    effective = replacement_alpha.copy()
+    effective[removal] = 255
+
+Outside the mask the replacement matte behaves exactly as in v1. Inside it
+the source clip contributes nothing: where the replacement person is, the O1
+person is copied; where only the old person was, O1's background is copied
+instead of the old person leaking through. Measured on the real mattes the
+mask covers ~96 % of visible source hair, costs 0.208 % of the frame per
+frame of true background (the dilation band; 0.694 % removal in total) and
+shows no flicker signature. Radius 2 left too much hair; radius 6 replaced
+markedly more background for little gain. No ``max()`` and no partial source
+alpha anywhere in v4, and still no feathering, temporal smoothing or
+inpainting. The dilation is plain NumPy — a shifted OR per integer offset
+inside the disk, clipped at the border — so no scipy or OpenCV.
 """
 
 from __future__ import annotations
@@ -131,23 +163,32 @@ __all__ = [
     "ALPHA_DECODERS",
     "ALPHA_PIX_FMTS",
     "SOURCE_HARDEN_THRESHOLD",
+    "SOURCE_REMOVAL_DILATION_RADIUS",
+    "SOURCE_REMOVAL_THRESHOLD",
     "CompositeError",
     "CompositeReport",
     "HardenedUnionCompositeReport",
     "HardenedUnionStreamStats",
+    "SourceRemovalCompositeReport",
+    "SourceRemovalStreamStats",
     "UnionCompositeReport",
     "UnionStreamStats",
     "VideoInfo",
     "composite_frame",
     "composite_streams",
     "composite_streams_hardened_union",
+    "composite_streams_source_removal",
     "composite_streams_union",
     "composite_video",
     "composite_video_hardened_union",
+    "composite_video_source_removal",
     "composite_video_union",
+    "dilate_disk",
     "hardened_union_alpha",
     "probe_video",
+    "removal_effective_alpha",
     "soft_edge_ratio",
+    "source_removal_mask",
     "union_alpha",
 ]
 
@@ -180,6 +221,13 @@ ALPHA_PIX_FMTS = frozenset(
 # read-only sweep over {160, 192, 208, 224, 240}: the only candidate that
 # materially removed the old person's ghosting. See the module docstring.
 SOURCE_HARDEN_THRESHOLD = 160
+
+# Source-removal mask for the v4 composite: the source matte becomes a binary
+# support (alpha >= threshold, dilated by a Euclidean disk of this radius)
+# rather than a blending weight. Chosen from a read-only morphology sweep over
+# thresholds {64, 96, 128} x radii {0, 2, 4, 6, 8}. See the module docstring.
+SOURCE_REMOVAL_THRESHOLD = 64
+SOURCE_REMOVAL_DILATION_RADIUS = 4
 
 
 class CompositeError(RuntimeError):
@@ -284,6 +332,42 @@ class HardenedUnionCompositeReport:
     union_lift_ratio: float
     hardened_ratio: float
     """See :class:`HardenedUnionStreamStats` for the three ratios."""
+
+
+@dataclass(frozen=True)
+class SourceRemovalStreamStats:
+    """Per-clip means gathered while streaming a source-removal composite."""
+
+    soft_edge_ratio: float
+    """Mean fraction of pixels per frame blended under the *effective* alpha —
+    the replacement matte's own soft edge outside the removal mask."""
+    removal_ratio: float
+    """Mean fraction of full-frame pixels per frame inside the removal mask."""
+    dilation_only_ratio: float
+    """Mean fraction of full-frame pixels per frame that the dilation added
+    beyond the ``source_alpha >= threshold`` core."""
+    replacement_override_ratio: float
+    """Mean fraction of full-frame pixels per frame where the mask forced a
+    replacement alpha below 255 up to 255."""
+
+
+@dataclass(frozen=True)
+class SourceRemovalCompositeReport:
+    """What one source-removal composite run produced."""
+
+    output_path: Path
+    frames: int
+    width: int
+    height: int
+    frame_rate: Fraction
+    threshold: int
+    dilation_radius: int
+    """The removal-mask parameters that were applied."""
+    soft_edge_ratio: float
+    removal_ratio: float
+    dilation_only_ratio: float
+    replacement_override_ratio: float
+    """See :class:`SourceRemovalStreamStats` for the four ratios."""
 
 
 # -- the pure part -------------------------------------------------------
@@ -421,11 +505,163 @@ def _harden_mask(
     return mask
 
 
+def dilate_disk(mask: NDArray[np.bool_], radius: int) -> NDArray[np.bool_]:
+    """Binary dilation by a Euclidean disk of integer ``radius``. Pure.
+
+    A pixel is set in the result if any set pixel of ``mask`` lies at an
+    integer offset ``(dy, dx)`` with ``dy*dy + dx*dx <= radius*radius`` — the
+    same disk the morphology analysis used. Radius 4 is therefore a 49-pixel
+    disk, not a 9x9 square: the square's corners are up to 5.7 px away and
+    are excluded. Implemented as one shifted OR per offset using slices, so
+    nothing wraps around the image border. ``radius == 0`` returns a copy.
+
+    Args:
+        mask: ``(H, W)`` bool.
+        radius: non-negative int.
+
+    Raises:
+        CompositeError: on a non-2-D or non-bool mask, or a negative or
+            non-int radius.
+    """
+    _check_mask(mask)
+    _check_radius(radius)
+    out: NDArray[np.bool_] = mask.copy()
+    height, width = mask.shape
+    for dy, dx in _disk_offsets(radius):
+        if (dy == 0 and dx == 0) or abs(dy) >= height or abs(dx) >= width:
+            continue
+        rows_to = slice(max(dy, 0), height + min(dy, 0))
+        rows_from = slice(max(-dy, 0), height + min(-dy, 0))
+        cols_to = slice(max(dx, 0), width + min(dx, 0))
+        cols_from = slice(max(-dx, 0), width + min(-dx, 0))
+        out[rows_to, cols_to] |= mask[rows_from, cols_from]
+    return out
+
+
+def _disk_offsets(radius: int) -> list[tuple[int, int]]:
+    """Integer ``(dy, dx)`` offsets inside a Euclidean disk, in a fixed order."""
+    limit = radius * radius
+    return [
+        (dy, dx)
+        for dy in range(-radius, radius + 1)
+        for dx in range(-radius, radius + 1)
+        if dy * dy + dx * dx <= limit
+    ]
+
+
+def source_removal_mask(
+    source_alpha: AlphaPlane,
+    *,
+    threshold: int = SOURCE_REMOVAL_THRESHOLD,
+    dilation_radius: int = SOURCE_REMOVAL_DILATION_RADIUS,
+) -> NDArray[np.bool_]:
+    """Where the old person must not survive: a binary support, not an alpha.
+
+    Args:
+        source_alpha: ``(H, W)`` uint8 matte of the person in the *source* clip.
+        threshold: source alpha at or above which a pixel is in the core,
+            ``1..255``. Defaults to :data:`SOURCE_REMOVAL_THRESHOLD`.
+        dilation_radius: Euclidean-disk radius in pixels, ``>= 0``. Defaults
+            to :data:`SOURCE_REMOVAL_DILATION_RADIUS`.
+
+    Returns:
+        ``(H, W)`` bool. Exactly::
+
+            core = source_alpha >= threshold
+            removal = dilate_disk(core, dilation_radius)
+
+    Raises:
+        CompositeError: on a non-2-D or non-uint8 plane, a threshold outside
+            ``1..255``, or a negative or non-int radius.
+
+    The alpha *value* matters only through the threshold: 63 is out, 64 is
+    in, and 64 and 255 are treated identically. The dilation deliberately
+    reaches pixels whose source alpha is 0 — that is where the matte's own
+    fine hair sits.
+    """
+    _check_alpha_plane("source", source_alpha)
+    _check_int_range("threshold", threshold, 1, 255)
+    _check_radius(dilation_radius)
+    return dilate_disk(_source_core(source_alpha, threshold), dilation_radius)
+
+
+def removal_effective_alpha(
+    source_alpha: AlphaPlane,
+    replacement_alpha: AlphaPlane,
+    *,
+    threshold: int = SOURCE_REMOVAL_THRESHOLD,
+    dilation_radius: int = SOURCE_REMOVAL_DILATION_RADIUS,
+) -> AlphaPlane:
+    """The replacement matte, forced opaque inside the source-removal mask. Pure.
+
+    Args:
+        source_alpha: ``(H, W)`` uint8 matte of the person in the *source* clip.
+        replacement_alpha: ``(H, W)`` uint8 matte of the person in the
+            *replacement* clip.
+        threshold: see :func:`source_removal_mask`.
+        dilation_radius: see :func:`source_removal_mask`.
+
+    Returns:
+        A new ``(H, W)`` uint8 plane. Exactly::
+
+            removal = source_removal_mask(source_alpha, threshold=..., dilation_radius=...)
+            effective = replacement_alpha.copy()
+            effective[removal] = 255
+
+    Raises:
+        CompositeError: as :func:`source_removal_mask`, or on mismatched
+            shapes or a non-uint8 replacement plane.
+
+    No ``max()`` and no partial source alpha: outside the mask the effective
+    alpha *is* the replacement matte, byte for byte; inside it the source clip
+    contributes exactly nothing to :func:`composite_frame`.
+    """
+    _check_alphas(source_alpha, replacement_alpha)
+    removal = source_removal_mask(
+        source_alpha, threshold=threshold, dilation_radius=dilation_radius
+    )
+    return _apply_removal(replacement_alpha, removal)
+
+
+def _source_core(source_alpha: AlphaPlane, threshold: int) -> NDArray[np.bool_]:
+    core: NDArray[np.bool_] = source_alpha >= threshold
+    return core
+
+
+def _apply_removal(replacement_alpha: AlphaPlane, removal: NDArray[np.bool_]) -> AlphaPlane:
+    effective: AlphaPlane = replacement_alpha.copy()
+    effective[removal] = 255
+    return effective
+
+
+def _check_mask(mask: NDArray[np.bool_]) -> None:
+    if mask.ndim != 2:
+        raise CompositeError(f"mask must be (H, W), got {mask.shape}")
+    if mask.dtype != np.bool_:
+        raise CompositeError(f"mask must be bool, got {mask.dtype}")
+
+
+def _check_radius(radius: int) -> None:
+    _check_int_range("dilation_radius", radius, 0, None)
+
+
+def _check_alpha_plane(name: str, alpha: AlphaPlane) -> None:
+    if alpha.ndim != 2:
+        raise CompositeError(f"{name} alpha must be (H, W), got {alpha.shape}")
+    if alpha.dtype != np.uint8:
+        raise CompositeError(f"{name} alpha must be uint8, got {alpha.dtype}")
+
+
 def _check_threshold(source_threshold: int) -> None:
-    if isinstance(source_threshold, bool) or not isinstance(source_threshold, int):
-        raise CompositeError(f"source_threshold must be an int, got {source_threshold!r}")
-    if not 1 <= source_threshold <= 255:
-        raise CompositeError(f"source_threshold must be in 1..255, got {source_threshold}")
+    _check_int_range("source_threshold", source_threshold, 1, 255)
+
+
+def _check_int_range(name: str, value: int, low: int, high: int | None) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CompositeError(f"{name} must be an int, got {value!r}")
+    if value < low or (high is not None and value > high):
+        bounds = f"in {low}..{high}" if high is not None else f">= {low}"
+        raise CompositeError(f"{name} must be {bounds}, got {value}")
 
 
 def _check_alphas(source_alpha: AlphaPlane, replacement_alpha: AlphaPlane) -> None:
@@ -629,6 +865,84 @@ def composite_streams_hardened_union(
         soft_edge_ratio=soft_total / frames,
         union_lift_ratio=lift_total / frames,
         hardened_ratio=hardened_total / frames,
+    )
+
+
+def composite_streams_source_removal(
+    source: IO[bytes],
+    replacement: IO[bytes],
+    source_matte: IO[bytes],
+    replacement_matte: IO[bytes],
+    output: IO[bytes],
+    *,
+    width: int,
+    height: int,
+    frames: int,
+    threshold: int = SOURCE_REMOVAL_THRESHOLD,
+    dilation_radius: int = SOURCE_REMOVAL_DILATION_RADIUS,
+) -> SourceRemovalStreamStats:
+    """Composite ``frames`` frames under the source-removal mask, one at a time.
+
+    As :func:`composite_streams_union`, but per frame::
+
+        removal = source_removal_mask(source_alpha, threshold=..., dilation_radius=...)
+        effective_alpha = replacement_alpha.copy()
+        effective_alpha[removal] = 255
+        output_frame = composite_frame(source_rgb, replacement_rgb, effective_alpha)
+
+    Returns:
+        :class:`SourceRemovalStreamStats` with the clip's mean ratios.
+
+    Raises:
+        CompositeError: if the threshold or radius is invalid (before anything
+            is read), if any of the four streams ends before ``frames``
+            frames, or if any still has data afterwards.
+    """
+    _check_int_range("threshold", threshold, 1, 255)
+    _check_radius(dilation_radius)
+    soft_total = 0.0
+    removal_total = 0.0
+    dilation_total = 0.0
+    override_total = 0.0
+
+    for index in range(frames):
+        source_frame = _read_rgb_frame(source, "source", index, width, height)
+        replacement_frame = _read_rgb_frame(replacement, "replacement", index, width, height)
+        source_alpha = _read_alpha_frame(source_matte, "source_matte", index, width, height)
+        replacement_alpha = _read_alpha_frame(
+            replacement_matte, "replacement_matte", index, width, height
+        )
+
+        removal = source_removal_mask(
+            source_alpha, threshold=threshold, dilation_radius=dilation_radius
+        )
+        alpha = _apply_removal(replacement_alpha, removal)
+        size = float(alpha.size)
+        soft_total += soft_edge_ratio(alpha)
+        removal_total += float(np.count_nonzero(removal)) / size
+        core = _source_core(source_alpha, threshold)
+        dilation_total += float(np.count_nonzero(removal & ~core)) / size
+        overridden = removal & (replacement_alpha != 255)
+        override_total += float(np.count_nonzero(overridden)) / size
+        output.write(composite_frame(source_frame, replacement_frame, alpha).tobytes())
+
+    _assert_drained(
+        {
+            "source": source,
+            "replacement": replacement,
+            "source_matte": source_matte,
+            "replacement_matte": replacement_matte,
+        },
+        frames,
+    )
+
+    if not frames:
+        return SourceRemovalStreamStats(0.0, 0.0, 0.0, 0.0)
+    return SourceRemovalStreamStats(
+        soft_edge_ratio=soft_total / frames,
+        removal_ratio=removal_total / frames,
+        dilation_only_ratio=dilation_total / frames,
+        replacement_override_ratio=override_total / frames,
     )
 
 
@@ -978,6 +1292,81 @@ def composite_video_hardened_union(
     )
 
 
+def composite_video_source_removal(
+    source_path: Path,
+    replacement_path: Path,
+    source_matte_path: Path,
+    replacement_matte_path: Path,
+    output_path: Path,
+    *,
+    threshold: int = SOURCE_REMOVAL_THRESHOLD,
+    dilation_radius: int = SOURCE_REMOVAL_DILATION_RADIUS,
+    crf: int = 16,
+    preset: str = "slow",
+) -> SourceRemovalCompositeReport:
+    """Composite four clips into one H.264 MP4 under the source-removal mask.
+
+    As :func:`composite_video_union` — same four inputs, same fail-closed
+    validation, same ``libvpx-vp9`` alpha decoding, same streaming — but the
+    source matte is used only as the binary support of
+    :func:`source_removal_mask`, and the effective alpha is
+    :func:`removal_effective_alpha`.
+
+    Args:
+        source_path: the original footage.
+        replacement_path: the edited footage (Kling O1).
+        source_matte_path: matte of the person in the *source* clip.
+        replacement_matte_path: matte of the person in the *replacement* clip.
+        output_path: the ``.mp4`` to write.
+        threshold: see :func:`source_removal_mask`. Defaults to
+            :data:`SOURCE_REMOVAL_THRESHOLD`.
+        dilation_radius: see :func:`source_removal_mask`. Defaults to
+            :data:`SOURCE_REMOVAL_DILATION_RADIUS`.
+        crf: x264 quality, as for :func:`composite_video`.
+        preset: x264 speed/efficiency preset.
+
+    Returns:
+        A :class:`SourceRemovalCompositeReport` with the four mean ratios.
+
+    Raises:
+        CompositeError: as :func:`composite_video_union`, or if the threshold
+            or radius is invalid (checked before anything is probed).
+    """
+    _check_int_range("threshold", threshold, 1, 255)
+    _check_radius(dilation_radius)
+    source, decodes = _probe_union_inputs(
+        source_path, replacement_path, source_matte_path, replacement_matte_path
+    )
+    pipeline = _ffmpeg_pipeline(decodes, output_path, source, crf=crf, preset=preset)
+    with pipeline as (pipes, encode):
+        stats = composite_streams_source_removal(
+            pipes["source"],
+            pipes["replacement"],
+            pipes["source_matte"],
+            pipes["replacement_matte"],
+            encode,
+            width=source.width,
+            height=source.height,
+            frames=source.frame_count,
+            threshold=threshold,
+            dilation_radius=dilation_radius,
+        )
+
+    return SourceRemovalCompositeReport(
+        output_path=output_path,
+        frames=source.frame_count,
+        width=source.width,
+        height=source.height,
+        frame_rate=source.frame_rate,
+        threshold=threshold,
+        dilation_radius=dilation_radius,
+        soft_edge_ratio=stats.soft_edge_ratio,
+        removal_ratio=stats.removal_ratio,
+        dilation_only_ratio=stats.dilation_only_ratio,
+        replacement_override_ratio=stats.replacement_override_ratio,
+    )
+
+
 def _probe_union_inputs(
     source_path: Path,
     replacement_path: Path,
@@ -986,8 +1375,9 @@ def _probe_union_inputs(
 ) -> tuple[VideoInfo, dict[str, _Decode]]:
     """Probe and validate the four dual-matte inputs; say how to decode each.
 
-    Shared by the union and hardened-union composites so both fail closed on
-    exactly the same conditions, before any ffmpeg process is spawned.
+    Shared by every dual-matte composite (union, hardened union, source
+    removal) so all of them fail closed on exactly the same conditions,
+    before any ffmpeg process is spawned.
     """
     source = probe_video(source_path)
     replacement = probe_video(replacement_path)

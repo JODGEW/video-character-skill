@@ -205,6 +205,57 @@ print(composite_video_hardened_union(
 ))"
 ```
 
+### Source-removal mask (v4 POC)
+
+Visual QA of `composite_v3_hardened.mp4` still showed the old person's hair
+around the replacement. A read-only morphology sweep explained why: below
+alpha 128 the source matte is not a blending weight worth honouring. 69 % of
+those pixels sit at alpha ≤ 7 and 10–30 px from the silhouette (VP9 alpha
+compression haze), while the hair you can see (alpha ≥ 32) lies within 4 px
+(p90) of the `alpha >= 64` core — and blending with *any* partial source alpha
+keeps most of a strand, because the source pixel *is* the strand.
+
+v4 stops treating the source matte as an alpha. It is a binary support — "the
+old person must not survive here" — from threshold **64** and a Euclidean-disk
+dilation of **4 px**:
+
+```
+source_core = source_alpha >= 64
+removal     = dilate_disk(source_core, 4)      # offsets with dy² + dx² <= 16
+effective   = replacement_alpha.copy()
+effective[removal] = 255
+output      = composite_frame(source, replacement, effective)
+```
+
+Outside the mask the replacement matte behaves exactly as in v1. Inside it the
+source clip contributes nothing: where the replacement person is, the O1
+person is copied; where only the old person was, O1's background is copied
+instead of the old person leaking through. Measured on the real mattes the
+mask covers ~96 % of visible source hair, costs 0.208 % of the frame per frame
+of true background (the dilation band; 0.694 % removal in total) and shows no
+flicker signature; radius 2 left too much hair, radius 6 replaced markedly
+more background for little gain. No `max()`, no partial source alpha, no
+feathering, temporal smoothing or inpainting. The dilation is a deterministic
+NumPy shifted-OR over the integer disk offsets (no scipy/OpenCV), clipped at
+the image border. The report carries `removal_ratio`, `dilation_only_ratio`
+(added by dilation beyond the core) and `replacement_override_ratio` (where the
+mask forced a replacement alpha below 255 to 255).
+
+To produce the v4 composite locally:
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from video_character_skill import composite_video_source_removal
+print(composite_video_source_removal(
+    Path('out/source_aligned_24fps.mp4'),
+    Path('out/o1_strict_prompt.mp4'),
+    Path('out/source_matte.webm'),
+    Path('out/o1_matte.webm'),
+    Path('out/composite_v4_removal.mp4'),
+))"
+```
+
 ## Layout
 
 ```
@@ -218,7 +269,8 @@ src/video_character_skill/
   providers/fal_sam3.py      # SAM 3 per-object video segmentation (superseded)
   providers/fal_veed_matting.py  # VEED background removal -> alpha matte
   compositor.py              # alpha-composite the replacement onto the original;
-                             # v1 single matte, v2 union of both mattes, v3 hardened union
+                             # v1 single matte, v2 union, v3 hardened union,
+                             # v4 source-removal mask (binary support + disk dilation)
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```

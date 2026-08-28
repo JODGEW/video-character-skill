@@ -2,15 +2,21 @@
 
 from video_character_skill.compositor import (
     SOURCE_HARDEN_THRESHOLD,
+    SOURCE_REMOVAL_DILATION_RADIUS,
+    SOURCE_REMOVAL_THRESHOLD,
     CompositeError,
     CompositeReport,
     HardenedUnionCompositeReport,
+    SourceRemovalCompositeReport,
     UnionCompositeReport,
     composite_frame,
     composite_video,
     composite_video_hardened_union,
+    composite_video_source_removal,
     composite_video_union,
     hardened_union_alpha,
+    removal_effective_alpha,
+    source_removal_mask,
     union_alpha,
 )
 from video_character_skill.masks import (
@@ -42,10 +48,13 @@ from video_character_skill.schemas import (
 
 __all__ = [
     "SOURCE_HARDEN_THRESHOLD",
+    "SOURCE_REMOVAL_DILATION_RADIUS",
+    "SOURCE_REMOVAL_THRESHOLD",
     "CharacterOrientation",
     "CompositeError",
     "CompositeReport",
     "HardenedUnionCompositeReport",
+    "SourceRemovalCompositeReport",
     "MaskDecodeError",
     "DrivingVideo",
     "IdentityElement",
@@ -67,12 +76,15 @@ __all__ = [
     "composite_frame",
     "composite_video",
     "composite_video_hardened_union",
+    "composite_video_source_removal",
     "composite_video_union",
     "decode_object_mask",
     "decode_rle",
     "hardened_union_alpha",
     "mask_area_ratio",
     "mask_bbox",
+    "removal_effective_alpha",
+    "source_removal_mask",
     "union_alpha",
 ]
 
