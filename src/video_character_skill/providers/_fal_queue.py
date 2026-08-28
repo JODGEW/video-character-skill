@@ -1,9 +1,13 @@
 """Shared plumbing for fal.ai queue-backed providers.
 
 Every fal endpoint we target has the same lifecycle — upload local files, POST
-to the queue, poll a status, fetch a result ``File`` — and differs only in its
-application id and request body. That common part lives here; subclasses supply
-:attr:`app_id` and :meth:`build_arguments`.
+to the queue, poll a status, fetch a result — and differs only in its
+application id, request body and result shape.
+
+:class:`FalQueueBase` owns the part that is the same everywhere. On top of it,
+:class:`FalQueueProvider` serves character-transfer endpoints (one video in,
+one video out); segmentation endpoints, whose results are not videos at all,
+build on the base directly.
 """
 
 from __future__ import annotations
@@ -44,23 +48,25 @@ class FalQueueClient(Protocol):
     def result(self, application: str, request_id: str) -> Any: ...
 
 
-class FalQueueProvider(CharacterTransferProvider):
-    """Submit / poll / fetch against one fal application."""
+class FalQueueBase:
+    """Submit / poll / fetch against one fal application.
 
+    Endpoint-agnostic: it knows the queue lifecycle and how to turn a local
+    path into a fal URL, but nothing about any particular request body or
+    result shape. Subclasses add the typed ``submit``/``get_result`` pair for
+    the job kind they serve.
+    """
+
+    name: ClassVar[str]
     app_id: ClassVar[str]
 
     def __init__(self, client: FalQueueClient | None = None) -> None:
         # SyncClient resolves FAL_KEY lazily, at request time.
         self._client: FalQueueClient = client if client is not None else fal_client.SyncClient()
 
-    @abstractmethod
-    def build_arguments(self, request: TransferRequest) -> dict[str, Any]:
-        """Build the endpoint's request body, uploading any local files first."""
+    # -- queue lifecycle -----------------------------------------------
 
-    # -- interface -----------------------------------------------------
-
-    def submit(self, request: TransferRequest) -> Job:
-        arguments = self.build_arguments(request)
+    def _enqueue(self, arguments: dict[str, Any]) -> Job:
         try:
             handle = self._client.submit(self.app_id, arguments)
         except fal_client.FalClientError as exc:
@@ -74,16 +80,21 @@ class FalQueueProvider(CharacterTransferProvider):
             raise ProviderError(f"fal status failed for {job_id}: {exc}") from exc
         return self._to_job(job_id, status)
 
-    def get_result(self, job_id: str) -> ResultVideo:
+    def _result_payload(self, job_id: str) -> Any:
+        """Fetch a succeeded job's raw result body.
+
+        A fal job that the queue reports as ``Completed`` can still fail when
+        its result is fetched, so the status check happens here rather than in
+        the caller.
+        """
         job = self.get_status(job_id)
         if job.status is not JobStatus.SUCCEEDED:
             detail = f": {job.error}" if job.error else ""
             raise ProviderError(f"job {job_id} is {job.status.value}, not succeeded{detail}")
         try:
-            payload = self._client.result(self.app_id, job_id)
+            return self._client.result(self.app_id, job_id)
         except fal_client.FalClientError as exc:
             raise ProviderError(f"fal result failed for {job_id}: {exc}") from exc
-        return self._to_result_video(job_id, payload)
 
     # -- uploads -------------------------------------------------------
 
@@ -124,6 +135,20 @@ class FalQueueProvider(CharacterTransferProvider):
     def _error_text(status: fal_client.Completed) -> str:
         parts = [str(part) for part in (status.error_type, status.error) if part]
         return ": ".join(parts) or "unknown error"
+
+
+class FalQueueProvider(FalQueueBase, CharacterTransferProvider):
+    """A character-transfer endpoint on the fal queue."""
+
+    @abstractmethod
+    def build_arguments(self, request: TransferRequest) -> dict[str, Any]:
+        """Build the endpoint's request body, uploading any local files first."""
+
+    def submit(self, request: TransferRequest) -> Job:
+        return self._enqueue(self.build_arguments(request))
+
+    def get_result(self, job_id: str) -> ResultVideo:
+        return self._to_result_video(job_id, self._result_payload(job_id))
 
     def _to_result_video(self, job_id: str, payload: Any) -> ResultVideo:
         video = payload.get("video") if isinstance(payload, dict) else None

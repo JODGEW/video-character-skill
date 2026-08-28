@@ -152,3 +152,77 @@ class ResultVideo(MediaAsset):
 
     duration_seconds: float | None = Field(default=None, gt=0)
     content_type: str = "video/mp4"
+
+
+class SegmentationRequest(BaseModel):
+    """Track one concept through a video and return its per-frame masks.
+
+    ``prompt`` names a single concept, not one instance: SAM 3 tracks every
+    instance it detects and gives each its own track id. For our pipeline the
+    concept is ``"person"`` and we expect exactly one track.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    driving_video: DrivingVideo
+    prompt: str = Field(default="person", min_length=1)
+    detection_threshold: float = Field(
+        default=0.5,
+        ge=0.01,
+        le=1.0,
+        description="Lower finds more instances but less precisely.",
+    )
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt_must_be_non_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("prompt must not be blank")
+        return stripped
+
+
+class ObjectMask(BaseModel):
+    """One tracked object's mask in one frame, run-length encoded.
+
+    ``rle`` is decoded against the :class:`VideoMaskTrack` dimensions, not
+    against anything carried here.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    track_id: int
+    rle: str = Field(min_length=1)
+
+
+class MaskFrame(BaseModel):
+    """The masks present in a single frame of the source video."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    frame_index: int = Field(ge=0)
+    objects: tuple[ObjectMask, ...] = ()
+
+
+class VideoMaskTrack(BaseModel):
+    """Per-frame, per-object masks for one segmented video.
+
+    The temporal mask a masked edit needs: every frame carries the mask of each
+    tracked object, and a track id stays with the same object across the whole
+    clip. ``width``/``height`` are the dimensions the RLE decodes to.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    frames: tuple[MaskFrame, ...]
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    num_frames: int = Field(ge=0)
+
+    @property
+    def track_ids(self) -> tuple[int, ...]:
+        """Every track id seen anywhere in the clip, ascending.
+
+        One id means one tracked subject — what a single-person edit needs.
+        """
+        return tuple(sorted({mask.track_id for frame in self.frames for mask in frame.objects}))

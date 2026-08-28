@@ -13,20 +13,48 @@ clothing style.
 
 ## Status
 
-One provider implemented: **Kling V3 Standard Motion Control** on fal.ai
-(`fal-ai/kling-video/v3/standard/motion-control`). Submit / status / result are
-wired up, local files are uploaded to fal storage on submit, and every test runs
-against a fake client — **no real inference call has been made yet**. There is
-no polling loop and no retry logic; the caller polls `get_status` itself.
+Prompt-only editing is no longer the target architecture. A Kling O1 POC
+(`fal-ai/kling-video/o1/video-to-video/edit`) did replace the person, but it
+materially regenerated the original room background even under a strict prompt
+demanding a frame-faithful background — so background preservation has to be
+*enforced*, with a temporal person mask, not asked for.
+
+Three providers are implemented, all submit / status / result against the fal
+queue, all covered only by fakes — **no real inference call has been made yet**:
+
+| Provider | fal endpoint | Role |
+| --- | --- | --- |
+| `FalKlingProvider` | `fal-ai/kling-video/v3/standard/motion-control` | regenerates the scene; superseded |
+| `FalKlingO1EditProvider` | `fal-ai/kling-video/o1/video-to-video/edit` | prompt-only edit; the POC above |
+| `FalSam3VideoMaskProvider` | `fal-ai/sam-3/video-rle-objects` | per-frame person masks for the masked pipeline |
+
+Nothing masked-edits or composites yet: the SAM 3 provider only obtains the
+mask. There is no polling loop and no retry logic; the caller polls
+`get_status` itself.
+
+## Why `video-rle-objects` for masks
+
+Of fal's SAM 3 endpoints, only this one returns mask *data* rather than a
+rendered video. `sam-3/video` and `sam-3/video-rle` both declare
+`SAM3VideoOutput` (a `video` File) — `apply_mask` only changes what is drawn
+into that video, and `video-rle` "collapses every tracked object into a single
+union mask per frame". `sam-3/image-rle` returns real RLE but per image, with
+no tracking. `sam-3/video-rle-objects` returns, per frame, one RLE mask per
+tracked object plus a track id that is stable across the whole clip. See
+`providers/fal_sam3.py` for the full comparison and the verbatim schemas.
 
 ## Layout
 
 ```
 src/video_character_skill/
-  schemas.py              # ReferenceImage, DrivingVideo, TransferRequest, Job, JobStatus, ResultVideo
-  providers/base.py       # CharacterTransferProvider: submit / get_status / get_result
-  providers/fal_kling.py  # FalKlingProvider (fal.ai queue API)
-tests/                    # schema validation, provider contract, fal payload/mapping
+  schemas.py                 # media assets, TransferRequest, SegmentationRequest,
+                             # Job/JobStatus, ResultVideo, VideoMaskTrack
+  providers/base.py          # CharacterTransferProvider: submit / get_status / get_result
+  providers/_fal_queue.py    # FalQueueBase (queue + uploads), FalQueueProvider
+  providers/fal_kling.py     # Kling V3 Standard Motion Control
+  providers/fal_kling_o1.py  # Kling O1 video-to-video edit
+  providers/fal_sam3.py      # SAM 3 per-object video segmentation
+tests/                       # schema validation, provider contract, fal payload/mapping
 ```
 
 Media is referenced by URI only (an `http(s)` URL or a local path). Local paths
@@ -54,5 +82,6 @@ mypy
 
 ## Sample assets
 
-`reference_image.png` and `driving_video.mov` in the repo root are local test
-inputs and are git-ignored — bring your own.
+`reference_image.png`, `driving_video.mov` and `driving_video_o1.mp4` in the
+repo root are local test inputs and are git-ignored — bring your own.
+`driving_video_o1.mp4` is 1080x1920, 30 fps, 285 frames (9.5 s).

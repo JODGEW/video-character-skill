@@ -9,9 +9,13 @@ from video_character_skill.schemas import (
     IdentityElement,
     Job,
     JobStatus,
+    MaskFrame,
+    ObjectMask,
     ReferenceImage,
     ResultVideo,
+    SegmentationRequest,
     TransferRequest,
+    VideoMaskTrack,
 )
 
 
@@ -121,3 +125,42 @@ def test_transfer_request_has_no_element_by_default() -> None:
         driving_video=DrivingVideo(uri="./driving_video.mov"),
     )
     assert request.identity_element is None
+
+
+def test_segmentation_request_defaults_to_one_person_at_half_threshold() -> None:
+    request = SegmentationRequest(driving_video=DrivingVideo(uri="./driving_video_o1.mp4"))
+    assert request.prompt == "person"
+    assert request.detection_threshold == 0.5
+
+
+def test_segmentation_request_strips_its_prompt_and_rejects_blanks() -> None:
+    video = DrivingVideo(uri="./driving_video_o1.mp4")
+    assert SegmentationRequest(driving_video=video, prompt="  person  ").prompt == "person"
+    with pytest.raises(ValidationError):
+        SegmentationRequest(driving_video=video, prompt=" ")
+
+
+def test_mask_track_reports_track_ids_once_ascending() -> None:
+    track = VideoMaskTrack(
+        frames=(
+            MaskFrame(frame_index=0, objects=(ObjectMask(track_id=2, rle="1 2"),)),
+            MaskFrame(frame_index=1, objects=()),
+            MaskFrame(
+                frame_index=2,
+                objects=(ObjectMask(track_id=2, rle="3 4"), ObjectMask(track_id=1, rle="5 6")),
+            ),
+        ),
+        width=1080,
+        height=1920,
+        num_frames=3,
+    )
+    assert track.track_ids == (1, 2)
+
+
+def test_mask_track_requires_positive_decode_dimensions() -> None:
+    with pytest.raises(ValidationError):
+        VideoMaskTrack(frames=(), width=0, height=1920, num_frames=0)
+
+
+def test_empty_mask_track_has_no_track_ids() -> None:
+    assert VideoMaskTrack(frames=(), width=8, height=8, num_frames=0).track_ids == ()

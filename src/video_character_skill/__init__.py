@@ -6,10 +6,14 @@ from video_character_skill.schemas import (
     IdentityElement,
     Job,
     JobStatus,
+    MaskFrame,
+    ObjectMask,
     ReferenceImage,
     ResultVideo,
+    SegmentationRequest,
     TransferRequest,
     VideoEditRequest,
+    VideoMaskTrack,
 )
 
 __all__ = [
@@ -18,10 +22,14 @@ __all__ = [
     "IdentityElement",
     "Job",
     "JobStatus",
+    "MaskFrame",
+    "ObjectMask",
     "ReferenceImage",
     "ResultVideo",
+    "SegmentationRequest",
     "TransferRequest",
     "VideoEditRequest",
+    "VideoMaskTrack",
 ]
 
 __version__ = "0.0.1"
