@@ -20,7 +20,7 @@ demanding a frame-faithful background — so background preservation has to be
 *enforced*, with a temporal person mask, not asked for.
 
 Three providers are implemented, all submit / status / result against the fal
-queue, all covered only by fakes — **no real inference call has been made yet**:
+queue, all covered in tests by fakes only:
 
 | Provider | fal endpoint | Role |
 | --- | --- | --- |
@@ -28,9 +28,25 @@ queue, all covered only by fakes — **no real inference call has been made yet*
 | `FalKlingO1EditProvider` | `fal-ai/kling-video/o1/video-to-video/edit` | prompt-only edit; the POC above |
 | `FalSam3VideoMaskProvider` | `fal-ai/sam-3/video-rle-objects` | per-frame person masks for the masked pipeline |
 
-Nothing masked-edits or composites yet: the SAM 3 provider only obtains the
-mask. There is no polling loop and no retry logic; the caller polls
-`get_status` itself.
+Nothing masked-edits or composites yet: the SAM 3 provider obtains the mask and
+`masks.py` decodes it. There is no polling loop and no retry logic; the caller
+polls `get_status` itself.
+
+Two real `video-rle-objects` runs over `driving_video_o1.mp4` confirmed the
+endpoint: 285/285 frames returned, exactly one stable `track_id` (0), and mask
+dimensions of 1080x1920 matching the source exactly. Tightening the prompt
+("young man", threshold 0.8) changed the masks only negligibly, so the defaults
+stand — `prompt="person"`, `detection_threshold=0.5`.
+
+## The RLE format
+
+fal documents `rle` only as "Run-length encoding (Kaggle/COCO order)", which
+names two incompatible formats. Those same runs settled it: the strings are
+**1-based start/length pairs flattened row-major (C order)**, not COCO
+alternating runs. Consecutive starts sit ~1080 apart — one frame width — and
+decoding that way puts the mask on the subject; read as COCO the values sum to
+1,065,761,049 against a 2,073,600-pixel frame. `masks.decode_rle` implements
+exactly that contract and rejects anything else rather than clipping it.
 
 ## Why `video-rle-objects` for masks
 
@@ -54,13 +70,17 @@ src/video_character_skill/
   providers/fal_kling.py     # Kling V3 Standard Motion Control
   providers/fal_kling_o1.py  # Kling O1 video-to-video edit
   providers/fal_sam3.py      # SAM 3 per-object video segmentation
-tests/                       # schema validation, provider contract, fal payload/mapping
+  masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
+tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```
 
 Media is referenced by URI only (an `http(s)` URL or a local path). Local paths
 are uploaded through `fal_client.upload_file` at submit time; remote URLs are
 passed through untouched. Nothing here decodes or re-encodes video — no FFmpeg,
 no storage layer of our own.
+
+Masks are the one thing that becomes an array: `masks.py` turns an `ObjectMask`
+into a NumPy boolean mask for the compositing step to come.
 
 ## Local setup
 
