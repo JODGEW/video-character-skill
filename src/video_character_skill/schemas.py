@@ -95,6 +95,24 @@ class TransferRequest(BaseModel):
     )
 
 
+class VideoEditRequest(TransferRequest):
+    """A transfer performed as an *edit* of the source video.
+
+    Same inputs as :class:`TransferRequest`, plus extra appearance references.
+    The source video's background, framing and motion are meant to survive; only
+    the person is replaced. ``character_orientation`` is inherited but has no
+    meaning for edit endpoints.
+    """
+
+    style_images: tuple[ReferenceImage, ...] = Field(
+        default=(),
+        description=(
+            "Extra images showing clothing/appearance to imitate, distinct from "
+            "the identity binding. Providers cap how many they accept."
+        ),
+    )
+
+
 class JobStatus(str, Enum):
     """Lifecycle of a submitted job, normalized across providers."""
 

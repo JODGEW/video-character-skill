@@ -9,6 +9,7 @@ from video_character_skill.schemas import (
     ReferenceImage,
     ResultVideo,
     TransferRequest,
+    VideoEditRequest,
 )
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "ReferenceImage",
     "ResultVideo",
     "TransferRequest",
+    "VideoEditRequest",
 ]
 
 __version__ = "0.0.1"
