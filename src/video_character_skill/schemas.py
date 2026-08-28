@@ -226,3 +226,48 @@ class VideoMaskTrack(BaseModel):
         One id means one tracked subject — what a single-person edit needs.
         """
         return tuple(sorted({mask.track_id for frame in self.frames for mask in frame.objects}))
+
+
+class SourceVideo(MediaAsset):
+    """A video to be processed as-is, e.g. matted.
+
+    Distinct from :class:`DrivingVideo`, which is a *motion reference*. The
+    matting input is whatever footage the matte must line up with — for this
+    pipeline, the edited video the compositor will cut the person out of.
+    """
+
+
+class MatteCodec(str, Enum):
+    """How a matting endpoint should encode its output.
+
+    ``VP9`` returns one WebM carrying a real alpha channel. ``H264`` returns
+    two separate videos (rgb and alpha); fal does not document which comes
+    first, so the provider refuses to guess. See
+    :mod:`video_character_skill.providers.fal_veed_matting`.
+    """
+
+    VP9 = "vp9"
+    H264 = "h264"
+
+
+class MattingRequest(BaseModel):
+    """Everything a matting provider needs to cut a subject out of a video."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_video: SourceVideo
+    subject_is_person: bool = True
+    refine_foreground_edges: bool = True
+    output_codec: MatteCodec = MatteCodec.VP9
+
+
+class MatteVideo(MediaAsset):
+    """A video whose alpha channel is the subject matte.
+
+    ``content_type`` is whatever the provider reported, unchanged — for VP9
+    that is ``video/webm``. The alpha lives in the file's own alpha channel,
+    so a decoder must be asked for it explicitly (e.g. ffmpeg ``-pix_fmt
+    rgba``); decoding to a 3-channel format silently drops the matte.
+    """
+
+    content_type: str | None = None

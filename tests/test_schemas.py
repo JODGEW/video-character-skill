@@ -10,10 +10,14 @@ from video_character_skill.schemas import (
     Job,
     JobStatus,
     MaskFrame,
+    MatteCodec,
+    MatteVideo,
+    MattingRequest,
     ObjectMask,
     ReferenceImage,
     ResultVideo,
     SegmentationRequest,
+    SourceVideo,
     TransferRequest,
     VideoMaskTrack,
 )
@@ -164,3 +168,26 @@ def test_mask_track_requires_positive_decode_dimensions() -> None:
 
 def test_empty_mask_track_has_no_track_ids() -> None:
     assert VideoMaskTrack(frames=(), width=8, height=8, num_frames=0).track_ids == ()
+
+
+def test_matting_request_defaults_to_a_refined_person_matte_in_vp9() -> None:
+    request = MattingRequest(source_video=SourceVideo(uri="./out/o1_strict_prompt.mp4"))
+    assert request.subject_is_person is True
+    assert request.refine_foreground_edges is True
+    assert request.output_codec is MatteCodec.VP9
+
+
+def test_matting_request_rejects_an_unknown_codec() -> None:
+    with pytest.raises(ValidationError):
+        MattingRequest(
+            source_video=SourceVideo(uri="./out/o1_strict_prompt.mp4"),
+            output_codec="prores",  # type: ignore[arg-type]
+        )
+
+
+def test_matte_video_has_no_assumed_content_type() -> None:
+    assert MatteVideo(uri="https://example.com/out.webm").content_type is None
+    assert (
+        MatteVideo(uri="https://example.com/out.webm", content_type="video/webm").content_type
+        == "video/webm"
+    )
