@@ -320,6 +320,73 @@ print(composite_video_temporal_recovery(
 ))"
 ```
 
+### Spatial real-background fill (v6 POC)
+
+Read-only attribution of `composite_v5_recovery.mp4` showed that temporal
+recovery works — recovered pixels sit against the surrounding real background
+as well as real background does (seam p90 11.8 vs 10.6 for the control) — and
+that the residual light patches are the pixels v5 could not recover at all:
+`temporal_unrecovered`, 0.12 % of the frame (~18 % of the recovery region),
+which fell back to O1's regenerated background (seam p90 103.8, systematically
+lighter than the room). A wider temporal search cannot fix them: ±48 frames
+recovers another 24 %, the whole clip 53 %, and 47 % are never real
+background at that coordinate because the old person's silhouette never moves
+off them.
+
+`spatial_recovery.composite_video_spatial_recovery` keeps v5 unchanged through
+temporal recovery and then fills only those pixels from real background next
+to them (new module `spatial_recovery.py`; v1–v5 untouched):
+
+```
+plate   = source_i with v5's recovered pixels written in                # no O1 yet
+trusted = (source_alpha_i < 32) | temporal_recovered                    # real background only
+target  = temporal_unrecovered                                          # the only pixels touched
+
+for each 8-connected component of target, inside its bbox + 1 px:
+    resolved = trusted pixels 8-adjacent to the component                # seeds
+    repeat (synchronous waves):
+        every unresolved component pixel with >= 1 resolved 8-neighbour
+            takes, per channel, the mean of those neighbours, rounded half up:
+            (2 * sum + count) // (2 * count)
+        all of them become resolved together
+    until no unresolved pixel has a resolved neighbour
+
+background = plate;  background[filled]   = wave values
+                     background[residual] = replacement_i               # O1 only here
+effective_alpha = replacement_alpha_i;  effective_alpha[force_replacement] = 255
+output = composite_frame(background, replacement_i, effective_alpha)
+```
+
+Every wave reads only the resolved state left by the previous wave, so the
+result does not depend on traversal order. Replacement-person, old-person and
+O1 pixels are never resolved, so nothing propagates through or from them; a
+component with no trusted neighbour stays unfilled and keeps the O1 fallback.
+Precedence inside the recovery region is now: own-frame real background, ±24
+temporal real background, spatially propagated real background, O1. The old
+person is never a fallback. No optical flow, registration, gain fitting,
+feathering, external inpainting or new dependency; the cache, donor search
+and photometric correction are v5's.
+
+The report carries v5's diagnostics plus the spatially recovered and
+unrecovered ratios (of the full frame), the O1-fallback share of the recovery
+region, the component count, the components without a seed, and the median,
+p90 and maximum propagation depth in waves.
+
+To produce the v6 composite locally:
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from video_character_skill import composite_video_spatial_recovery
+print(composite_video_spatial_recovery(
+    Path('out/source_aligned_24fps.mp4'),
+    Path('out/o1_strict_prompt.mp4'),
+    Path('out/source_matte.webm'),
+    Path('out/o1_matte.webm'),
+    Path('out/composite_v6_spatial.mp4'),
+))"
+```
+
 ## Layout
 
 ```
@@ -337,6 +404,8 @@ src/video_character_skill/
                              # v4 source-removal mask (binary support + disk dilation)
   temporal_recovery.py       # v5: real background borrowed from nearby source frames
                              # inside the v4 mask, with additive photometric correction
+  spatial_recovery.py        # v6: v5's unrecovered pixels filled by synchronous-wave
+                             # propagation from trusted real background, O1 last
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```

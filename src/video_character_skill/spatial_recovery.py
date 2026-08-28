@@ -1,0 +1,750 @@
+"""Spatial real-background fill — the v6 composite.
+
+Why
+---
+Read-only attribution of the v5 output (``composite_v5_recovery.mp4``)
+showed that temporal recovery works: the recovered pixels sit against the
+surrounding real background as well as real background does (seam p90 11.8
+vs 10.6 for the control). The residual light patches are the pixels v5 could
+not recover at all — ``temporal_unrecovered``, 0.12 % of the frame, ~18 % of
+the recovery region — which fell back to O1's regenerated background (seam
+p90 103.8, systematically lighter than the room). A wider temporal search
+cannot fix them: 47 % of those pixels are never real background at that
+coordinate in any frame, because the old person's silhouette never moves off
+them. They must be filled *spatially*, from real background next to them.
+
+Algorithm, per target frame ``i``
+---------------------------------
+Everything through temporal recovery is v5, unchanged (same masks, donors,
+photometric correction, cache). Then::
+
+    plate      = source_rgb_i with the recovered pixels written in     # no O1 yet
+    trusted    = (source_alpha_i < 32) | temporal_recovered            # real background only
+    target     = temporal_unrecovered                                  # the only pixels touched
+
+    for each 8-connected component of target, inside its bbox + 1 px:
+        resolved = trusted pixels 8-adjacent to the component           # seeds
+        repeat (synchronous waves):
+            for every unresolved component pixel with >= 1 resolved 8-neighbour:
+                rgb[c] = round_half_up(mean of the resolved neighbours' rgb[c])
+            mark those pixels resolved                                  # all at once
+        until no unresolved pixel has a resolved neighbour
+
+    background = plate;  background[filled]   = wave values
+                         background[residual] = replacement_i          # O1 only here
+    effective_alpha = replacement_alpha_i;  effective_alpha[force_replacement] = 255
+    output = composite_frame(background, replacement_i, effective_alpha)
+
+Each wave reads only the resolved state left by the previous wave, so the
+result is independent of traversal order. Replacement-person pixels, the old
+person's own pixels and O1 pixels are never resolved, so nothing propagates
+through or from them; a component with no trusted neighbour at all stays
+unfilled and keeps the O1 fallback. Precedence inside the recovery region is
+therefore: own-frame real background, temporally borrowed real background,
+spatially propagated real background, and only then O1. The old person is
+never a fallback. No optical flow, registration, gain fitting, feathering,
+external inpainting or new dependency.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+from typing import IO
+
+import numpy as np
+from numpy.typing import NDArray
+
+from video_character_skill.compositor import (
+    SOURCE_REMOVAL_DILATION_RADIUS,
+    SOURCE_REMOVAL_THRESHOLD,
+    AlphaPlane,
+    CompositeError,
+    RgbFrame,
+    _assert_drained,
+    _check_int_range,
+    _check_radius,
+    _ffmpeg_pipeline,
+    _probe_union_inputs,
+    _read_alpha_frame,
+    _read_rgb_frame,
+    composite_frame,
+    soft_edge_ratio,
+)
+from video_character_skill.temporal_recovery import (
+    MAX_TEMPORAL_OBSERVATIONS,
+    PHOTOMETRIC_MIN_SAMPLES,
+    PHOTOMETRIC_OFFSET_LIMIT,
+    PHOTOMETRIC_SUBSAMPLE_STRIDE,
+    REPLACEMENT_FOREGROUND_THRESHOLD,
+    SOURCE_BACKGROUND_THRESHOLD,
+    TEMPORAL_RECOVERY_RADIUS,
+    BoolMask,
+    Donor,
+    TemporalRecovery,
+    _hist_percentile,
+    _SourceWindow,
+    donor_frames,
+    recover_pixels,
+    recovery_effective_alpha,
+    recovery_regions,
+)
+
+__all__ = [
+    "SPATIAL_FILL_MARGIN",
+    "ComponentFill",
+    "FrameBackground",
+    "SpatialFill",
+    "SpatialRecoveryCompositeReport",
+    "SpatialRecoveryStreamStats",
+    "composite_streams_spatial_recovery",
+    "composite_video_spatial_recovery",
+    "label_components",
+    "recover_frame_background",
+    "spatial_fill_component",
+    "spatial_fill_components",
+    "temporal_plate",
+    "trusted_background",
+]
+
+# Pixels of context kept around a component's bounding box: one ring, which
+# is exactly the reach of an 8-neighbourhood.
+SPATIAL_FILL_MARGIN = 1
+
+# The eight (dy, dx) neighbour offsets, in a fixed order (the order is
+# irrelevant to the result: each wave only sums over them).
+_NEIGHBOURS = tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0))
+
+
+# -- results and reports -------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ComponentFill:
+    """What the wavefront produced for one component, on its crop."""
+
+    rgb: NDArray[np.uint8]
+    """Crop of the plate with the component's filled pixels written; else unchanged."""
+    filled: BoolMask
+    """Component pixels that were resolved by some wave."""
+    depth: NDArray[np.int32]
+    """Wave index (1-based) at which each filled pixel resolved; 0 elsewhere."""
+    seeds: int
+    """Trusted pixels 8-adjacent to the component that started the propagation."""
+
+
+@dataclass(frozen=True)
+class SpatialFill:
+    """What the spatial fill produced for one frame."""
+
+    rgb: RgbFrame
+    """The plate with every filled target pixel written; all other pixels unchanged."""
+    filled: BoolMask
+    """Target pixels that were filled."""
+    depth: NDArray[np.int32]
+    """Wave index (1-based) at which each filled pixel resolved; 0 elsewhere."""
+    components: int
+    """8-connected components of the target."""
+    components_without_seed: int
+    """Components with no trusted 8-neighbour; their pixels are left unfilled."""
+
+
+@dataclass(frozen=True)
+class FrameBackground:
+    """The v6 background plate for one frame and how it was assembled."""
+
+    background: RgbFrame
+    temporal_recovered: BoolMask
+    """Pixels that hold v5's temporally borrowed real background."""
+    temporal_unrecovered: BoolMask
+    """Pixels v5 could not recover: the spatial target."""
+    fill: SpatialFill
+    residual: BoolMask
+    """``temporal_unrecovered`` pixels the spatial fill could not reach: O1 fallback."""
+
+
+@dataclass(frozen=True)
+class SpatialRecoveryStreamStats:
+    """Clip-level diagnostics of a spatial-recovery composite.
+
+    Every ``*_ratio`` except ``o1_fallback_ratio`` is a mean over frames of a
+    fraction of the *full frame*. ``o1_fallback_ratio`` is the mean over
+    frames of the fraction of the *recovery region* that ended up as O1
+    background (frames with an empty region are skipped). The propagation
+    depths are over all spatially filled pixels of the clip, in waves
+    (1 = adjacent to a trusted seed); NaN / 0 when nothing was filled.
+    """
+
+    soft_edge_ratio: float
+    recovery_region_ratio: float
+    own_background_ratio: float
+    temporal_recovered_ratio: float
+    temporal_unrecovered_ratio: float
+    spatial_recovered_ratio: float
+    spatial_unrecovered_ratio: float
+    o1_fallback_ratio: float
+    spatial_components: int
+    components_without_seed: int
+    median_propagation_depth: float
+    p90_propagation_depth: float
+    max_propagation_depth: int
+    median_donor_distance: float
+    p90_donor_distance: float
+    mean_observations_per_recovered_pixel: float
+    donor_fits: int
+    zero_offset_fallbacks: int
+    peak_cached_frames: int
+
+
+@dataclass(frozen=True)
+class SpatialRecoveryCompositeReport:
+    """What one spatial-recovery composite run produced."""
+
+    output_path: Path
+    frames: int
+    width: int
+    height: int
+    frame_rate: Fraction
+    removal_threshold: int
+    dilation_radius: int
+    background_threshold: int
+    foreground_threshold: int
+    radius: int
+    max_observations: int
+    stats: SpatialRecoveryStreamStats
+
+
+# -- pure helpers --------------------------------------------------------
+
+
+def label_components(mask: BoolMask) -> tuple[NDArray[np.int32], int]:
+    """8-connected components of a bool mask. Pure and deterministic.
+
+    Returns ``(labels, count)``: ``labels`` is ``(H, W)`` int32 with 0 off
+    the mask and ``1..count`` on it, numbered in raster order of each
+    component's first pixel.
+    """
+    _check_mask("mask", mask)
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    ys, xs = np.nonzero(mask)
+    n = int(ys.size)
+    if n == 0:
+        return labels, 0
+    height, width = mask.shape
+    ids = np.full(mask.shape, -1, dtype=np.int64)
+    ids[ys, xs] = np.arange(n)
+    heads: list[NDArray[np.int64]] = []
+    tails: list[NDArray[np.int64]] = []
+    for dy, dx in ((0, 1), (1, -1), (1, 0), (1, 1)):  # each pair once
+        y2, x2 = ys + dy, xs + dx
+        inside = (y2 < height) & (x2 >= 0) & (x2 < width)
+        neighbour = ids[y2[inside], x2[inside]]
+        linked = neighbour >= 0
+        heads.append(np.flatnonzero(inside)[linked])
+        tails.append(neighbour[linked])
+    a = np.concatenate(heads)
+    b = np.concatenate(tails)
+    root = np.arange(n)
+    while True:  # hook every edge to the smaller root, then compress; repeat until stable
+        low = np.minimum(root[a], root[b])
+        hooked = root.copy()
+        np.minimum.at(hooked, root[a], low)
+        np.minimum.at(hooked, root[b], low)
+        while True:
+            jumped = hooked[hooked]
+            if np.array_equal(jumped, hooked):
+                break
+            hooked = jumped
+        if np.array_equal(hooked, root):
+            break
+        root = hooked
+    roots, inverse = np.unique(root, return_inverse=True)
+    labels[ys, xs] = inverse.astype(np.int32) + 1
+    return labels, int(roots.size)
+
+
+def spatial_fill_component(
+    rgb: NDArray[np.uint8], trusted: BoolMask, component: BoolMask
+) -> ComponentFill:
+    """Fill one component from its trusted 8-neighbours by synchronous waves. Pure.
+
+    Args:
+        rgb: ``(h, w, 3)`` uint8 crop of the plate.
+        trusted: ``(h, w)`` bool — real-background pixels whose values may be read.
+        component: ``(h, w)`` bool — the pixels to fill; disjoint from ``trusted``.
+
+    Wave ``k`` computes, for every still-unresolved component pixel with at
+    least one resolved 8-neighbour, the per-channel mean of those resolved
+    neighbours rounded half up, ``(2 * sum + count) // (2 * count)``, from
+    the resolved state at the end of wave ``k - 1``; then all of them become
+    resolved together. Resolved pixels are the seeds (trusted pixels
+    8-adjacent to the component) plus what earlier waves filled — never
+    other pixels of the crop, so nothing is read through replacement-person,
+    old-person or O1 pixels. Stops when no unresolved pixel has a resolved
+    neighbour; a component with no seed fills nothing.
+    """
+    _check_rgb("rgb", rgb)
+    _check_mask("trusted", trusted, rgb.shape[:2])
+    _check_mask("component", component, rgb.shape[:2])
+    if bool((trusted & component).any()):
+        raise CompositeError("trusted and component overlap")
+    resolved: BoolMask = trusted & _adjacent(component)
+    seeds = int(np.count_nonzero(resolved))
+    values = rgb.astype(np.int64)
+    filled = np.zeros(component.shape, dtype=np.bool_)
+    depth = np.zeros(component.shape, dtype=np.int32)
+    unresolved = component.copy()
+    wave = 0
+    while unresolved.any():
+        wave += 1
+        sums, counts = _neighbour_sums(values, resolved)
+        ready: BoolMask = unresolved & (counts > 0)
+        if not ready.any():
+            break
+        count = counts[ready][:, None]
+        values[ready] = (2 * sums[ready] + count) // (2 * count)
+        filled |= ready
+        depth[ready] = wave
+        resolved = resolved | ready  # only now: the next wave sees this wave's result
+        unresolved &= ~ready
+    out = rgb.copy()
+    out[filled] = values[filled].astype(np.uint8)
+    return ComponentFill(rgb=out, filled=filled, depth=depth, seeds=seeds)
+
+
+def spatial_fill_components(rgb: RgbFrame, trusted: BoolMask, target: BoolMask) -> SpatialFill:
+    """Fill every 8-connected component of ``target``, each on its own crop. Pure.
+
+    Only ``target`` pixels are ever written. Each component is processed on
+    its bounding box plus :data:`SPATIAL_FILL_MARGIN` and sees only
+    ``trusted`` pixels as seeds, so components never contaminate each other
+    even when they share a crop. Raises :class:`CompositeError` if
+    ``trusted`` and ``target`` overlap.
+    """
+    _check_rgb("rgb", rgb)
+    _check_mask("trusted", trusted, rgb.shape[:2])
+    _check_mask("target", target, rgb.shape[:2])
+    if bool((trusted & target).any()):
+        raise CompositeError("trusted and target overlap")
+    labels, count = label_components(target)
+    out: RgbFrame = rgb.copy()
+    filled = np.zeros(target.shape, dtype=np.bool_)
+    depth = np.zeros(target.shape, dtype=np.int32)
+    without_seed = 0
+    for label, (rows, cols) in enumerate(_component_windows(labels, count), start=1):
+        component: BoolMask = labels[rows, cols] == label
+        result = spatial_fill_component(rgb[rows, cols], trusted[rows, cols], component)
+        if result.seeds == 0:
+            without_seed += 1
+        window_out = out[rows, cols]
+        window_out[result.filled] = result.rgb[result.filled]
+        filled[rows, cols] |= result.filled
+        window_depth = depth[rows, cols]
+        window_depth[result.filled] = result.depth[result.filled]
+    return SpatialFill(
+        rgb=out,
+        filled=filled,
+        depth=depth,
+        components=count,
+        components_without_seed=without_seed,
+    )
+
+
+def trusted_background(
+    source_alpha: AlphaPlane,
+    temporal_recovered: BoolMask,
+    *,
+    background_threshold: int = SOURCE_BACKGROUND_THRESHOLD,
+) -> BoolMask:
+    """Real background the spatial fill may read from. Pure.
+
+    ``(source_alpha < background_threshold) | temporal_recovered``: the
+    frame's own real background plus what v5 borrowed from other frames.
+    Replacement-person pixels are never trusted.
+    """
+    _check_alpha("source_alpha", source_alpha)
+    _check_mask("temporal_recovered", temporal_recovered, source_alpha.shape)
+    _check_int_range("background_threshold", background_threshold, 1, 255)
+    trusted: BoolMask = (source_alpha < background_threshold) | temporal_recovered
+    return trusted
+
+
+def temporal_plate(
+    source_rgb: RgbFrame, recovery: TemporalRecovery
+) -> tuple[RgbFrame, BoolMask, BoolMask]:
+    """The source frame with v5's recovered pixels written in, and its two masks. Pure.
+
+    Returns ``(plate, temporal_recovered, temporal_unrecovered)``. Unlike
+    :func:`video_character_skill.temporal_recovery.recovered_background` no
+    O1 pixel is written: unrecovered pixels still hold the old person here
+    and are exactly the spatial target.
+    """
+    _check_rgb("source_rgb", source_rgb)
+    plate: RgbFrame = source_rgb.copy()
+    got = recovery.counts > 0
+    flat = plate.reshape(-1, 3)
+    flat[recovery.indices[got]] = recovery.rgb[got]
+    recovered = np.zeros(source_rgb.shape[:2], dtype=np.bool_).reshape(-1)
+    recovered[recovery.indices[got]] = True
+    unrecovered = np.zeros(source_rgb.shape[:2], dtype=np.bool_).reshape(-1)
+    unrecovered[recovery.indices[~got]] = True
+    return plate, recovered.reshape(source_rgb.shape[:2]), unrecovered.reshape(source_rgb.shape[:2])
+
+
+def recover_frame_background(
+    source_rgb: RgbFrame,
+    replacement_rgb: RgbFrame,
+    source_alpha: AlphaPlane,
+    recovery: TemporalRecovery,
+    *,
+    background_threshold: int = SOURCE_BACKGROUND_THRESHOLD,
+) -> FrameBackground:
+    """The v6 background plate for one frame. Pure.
+
+    Own-frame background and temporally recovered pixels are v5's, byte for
+    byte; ``temporal_unrecovered`` pixels are spatially filled from trusted
+    real background where a component has a trusted neighbour, and hold the
+    replacement (O1) pixel otherwise. The old person never survives.
+    """
+    _check_rgb("replacement_rgb", replacement_rgb)
+    if replacement_rgb.shape != source_rgb.shape:
+        raise CompositeError(
+            f"replacement shape {replacement_rgb.shape} != source shape {source_rgb.shape}"
+        )
+    plate, recovered, unrecovered = temporal_plate(source_rgb, recovery)
+    trusted = trusted_background(
+        source_alpha, recovered, background_threshold=background_threshold
+    )
+    fill = spatial_fill_components(plate, trusted, unrecovered)
+    residual: BoolMask = unrecovered & ~fill.filled
+    background: RgbFrame = fill.rgb.copy()
+    background[residual] = replacement_rgb[residual]
+    return FrameBackground(
+        background=background,
+        temporal_recovered=recovered,
+        temporal_unrecovered=unrecovered,
+        fill=fill,
+        residual=residual,
+    )
+
+
+def _adjacent(mask: BoolMask) -> BoolMask:
+    """Pixels with at least one 8-neighbour in ``mask`` (the mask itself included)."""
+    out = mask.copy()
+    height, width = mask.shape
+    for dy, dx in _NEIGHBOURS:
+        to, frm = _shifted(dy, dx, height, width)
+        out[to] |= mask[frm]
+    return out
+
+
+def _neighbour_sums(
+    values: NDArray[np.int64], resolved: BoolMask
+) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """Per-pixel sum of resolved 8-neighbours' RGB and how many there were."""
+    height, width = resolved.shape
+    sums = np.zeros((height, width, 3), dtype=np.int64)
+    counts = np.zeros((height, width), dtype=np.int64)
+    masked = values * resolved[:, :, None]
+    for dy, dx in _NEIGHBOURS:
+        to, frm = _shifted(dy, dx, height, width)
+        sums[to] += masked[frm]
+        counts[to] += resolved[frm]
+    return sums, counts
+
+
+def _shifted(
+    dy: int, dx: int, height: int, width: int
+) -> tuple[tuple[slice, slice], tuple[slice, slice]]:
+    """Index pairs so that ``out[to] op= src[frm]`` reads the neighbour at ``(dy, dx)``."""
+    rows_to = slice(max(-dy, 0), height - max(dy, 0))
+    rows_from = slice(max(dy, 0), height - max(-dy, 0))
+    cols_to = slice(max(-dx, 0), width - max(dx, 0))
+    cols_from = slice(max(dx, 0), width - max(-dx, 0))
+    return (rows_to, cols_to), (rows_from, cols_from)
+
+
+def _component_windows(labels: NDArray[np.int32], count: int) -> list[tuple[slice, slice]]:
+    """Bounding box + margin of each label ``1..count``, clipped to the frame."""
+    if count == 0:
+        return []
+    height, width = labels.shape
+    ys, xs = np.nonzero(labels)
+    index = labels[ys, xs] - 1
+    y0 = np.full(count, height, dtype=np.int64)
+    y1 = np.full(count, -1, dtype=np.int64)
+    x0 = np.full(count, width, dtype=np.int64)
+    x1 = np.full(count, -1, dtype=np.int64)
+    np.minimum.at(y0, index, ys)
+    np.maximum.at(y1, index, ys)
+    np.minimum.at(x0, index, xs)
+    np.maximum.at(x1, index, xs)
+    m = SPATIAL_FILL_MARGIN
+    return [
+        (
+            slice(max(int(y0[k]) - m, 0), min(int(y1[k]) + m + 1, height)),
+            slice(max(int(x0[k]) - m, 0), min(int(x1[k]) + m + 1, width)),
+        )
+        for k in range(count)
+    ]
+
+
+def _check_rgb(name: str, rgb: NDArray[np.uint8]) -> None:
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
+        raise CompositeError(f"{name} must be (H, W, 3) uint8, got {rgb.shape} {rgb.dtype}")
+
+
+def _check_alpha(name: str, alpha: AlphaPlane) -> None:
+    if alpha.ndim != 2 or alpha.dtype != np.uint8:
+        raise CompositeError(f"{name} must be (H, W) uint8, got {alpha.shape} {alpha.dtype}")
+
+
+def _check_mask(name: str, mask: BoolMask, shape: tuple[int, ...] | None = None) -> None:
+    if mask.ndim != 2 or mask.dtype != np.bool_:
+        raise CompositeError(f"{name} must be a 2-D bool mask, got {mask.shape} {mask.dtype}")
+    if shape is not None and mask.shape != tuple(shape):
+        raise CompositeError(f"{name} shape {mask.shape} != {tuple(shape)}")
+
+
+# -- streaming -----------------------------------------------------------
+
+
+def composite_streams_spatial_recovery(
+    source: IO[bytes],
+    replacement: IO[bytes],
+    source_matte: IO[bytes],
+    replacement_matte: IO[bytes],
+    output: IO[bytes],
+    *,
+    width: int,
+    height: int,
+    frames: int,
+    removal_threshold: int = SOURCE_REMOVAL_THRESHOLD,
+    dilation_radius: int = SOURCE_REMOVAL_DILATION_RADIUS,
+    background_threshold: int = SOURCE_BACKGROUND_THRESHOLD,
+    foreground_threshold: int = REPLACEMENT_FOREGROUND_THRESHOLD,
+    radius: int = TEMPORAL_RECOVERY_RADIUS,
+    max_observations: int = MAX_TEMPORAL_OBSERVATIONS,
+    offset_stride: int = PHOTOMETRIC_SUBSAMPLE_STRIDE,
+    offset_min_samples: int = PHOTOMETRIC_MIN_SAMPLES,
+    offset_limit: int = PHOTOMETRIC_OFFSET_LIMIT,
+) -> SpatialRecoveryStreamStats:
+    """Composite ``frames`` frames with temporal then spatial background recovery.
+
+    Same streams, read-ahead window, parameters and failure modes as
+    :func:`video_character_skill.temporal_recovery.composite_streams_temporal_recovery`;
+    the per-frame algorithm is the module docstring's.
+
+    Raises:
+        CompositeError: on an invalid parameter (before anything is read), if
+            any of the four streams ends before ``frames`` frames, or if any
+            still has data afterwards.
+    """
+    _check_int_range("removal_threshold", removal_threshold, 1, 255)
+    _check_radius(dilation_radius)
+    _check_int_range("background_threshold", background_threshold, 1, 255)
+    _check_int_range("foreground_threshold", foreground_threshold, 1, 255)
+    _check_int_range("radius", radius, 0, None)
+    _check_int_range("max_observations", max_observations, 1, None)
+    _check_int_range("offset_stride", offset_stride, 1, None)
+    _check_int_range("offset_min_samples", offset_min_samples, 1, None)
+    _check_int_range("offset_limit", offset_limit, 0, 255)
+
+    window = _SourceWindow(
+        source, source_matte, width=width, height=height, frames=frames, radius=radius
+    )
+    size = float(width * height)
+    soft_total = region_total = own_total = recovered_total = unrecovered_total = 0.0
+    spatial_total = residual_total = fallback_total = 0.0
+    frames_with_region = 0
+    distance_hist = np.zeros(radius + 1, dtype=np.int64)
+    depth_hist: NDArray[np.int64] = np.zeros(1, dtype=np.int64)
+    recovered_pixels = 0
+    observations_used = 0
+    fits = 0
+    fallbacks = 0
+    components = 0
+    without_seed = 0
+
+    for index in range(frames):
+        window.advance(index)
+        replacement_frame = _read_rgb_frame(replacement, "replacement", index, width, height)
+        replacement_alpha = _read_alpha_frame(
+            replacement_matte, "replacement_matte", index, width, height
+        )
+        source_frame, source_alpha = window.frame(index)
+
+        regions = recovery_regions(
+            source_alpha,
+            replacement_alpha,
+            removal_threshold=removal_threshold,
+            dilation_radius=dilation_radius,
+            background_threshold=background_threshold,
+            foreground_threshold=foreground_threshold,
+        )
+        donors: list[Donor] = [
+            (j, *window.frame(j)) for j in donor_frames(index, frames, radius)
+        ]
+        recovery = recover_pixels(
+            source_frame,
+            source_alpha,
+            regions.needs_temporal,
+            donors,
+            target_index=index,
+            background_threshold=background_threshold,
+            max_observations=max_observations,
+            offset_stride=offset_stride,
+            offset_min_samples=offset_min_samples,
+            offset_limit=offset_limit,
+        )
+        result = recover_frame_background(
+            source_frame,
+            replacement_frame,
+            source_alpha,
+            recovery,
+            background_threshold=background_threshold,
+        )
+        alpha = recovery_effective_alpha(replacement_alpha, regions.force_replacement)
+        output.write(composite_frame(result.background, replacement_frame, alpha).tobytes())
+
+        region_count = int(np.count_nonzero(regions.recovery_region))
+        got = int(np.count_nonzero(result.temporal_recovered))
+        missing = int(np.count_nonzero(result.temporal_unrecovered))
+        spatial = int(np.count_nonzero(result.fill.filled))
+        residual = int(np.count_nonzero(result.residual))
+        soft_total += soft_edge_ratio(alpha)
+        region_total += region_count / size
+        own_total += float(np.count_nonzero(regions.own_background)) / size
+        recovered_total += got / size
+        unrecovered_total += missing / size
+        spatial_total += spatial / size
+        residual_total += residual / size
+        if region_count:
+            frames_with_region += 1
+            fallback_total += residual / region_count
+        if recovery.distances.size:
+            distance_hist += np.bincount(recovery.distances, minlength=radius + 1)[: radius + 1]
+        if spatial:
+            depths = np.bincount(result.fill.depth[result.fill.filled])
+            if depths.size > depth_hist.size:
+                depth_hist = np.concatenate(
+                    [depth_hist, np.zeros(depths.size - depth_hist.size, dtype=np.int64)]
+                )
+            depth_hist[: depths.size] += depths
+        recovered_pixels += got
+        observations_used += int(recovery.counts.sum())
+        fits += recovery.donor_fits
+        fallbacks += recovery.zero_offset_fallbacks
+        components += result.fill.components
+        without_seed += result.fill.components_without_seed
+
+    _assert_drained(
+        {
+            "source": source,
+            "replacement": replacement,
+            "source_matte": source_matte,
+            "replacement_matte": replacement_matte,
+        },
+        frames,
+    )
+
+    nan = float("nan")
+    return SpatialRecoveryStreamStats(
+        soft_edge_ratio=soft_total / frames if frames else 0.0,
+        recovery_region_ratio=region_total / frames if frames else 0.0,
+        own_background_ratio=own_total / frames if frames else 0.0,
+        temporal_recovered_ratio=recovered_total / frames if frames else 0.0,
+        temporal_unrecovered_ratio=unrecovered_total / frames if frames else 0.0,
+        spatial_recovered_ratio=spatial_total / frames if frames else 0.0,
+        spatial_unrecovered_ratio=residual_total / frames if frames else 0.0,
+        o1_fallback_ratio=fallback_total / frames_with_region if frames_with_region else 0.0,
+        spatial_components=components,
+        components_without_seed=without_seed,
+        median_propagation_depth=_hist_percentile(depth_hist, 50),
+        p90_propagation_depth=_hist_percentile(depth_hist, 90),
+        max_propagation_depth=int(np.flatnonzero(depth_hist).max()) if depth_hist.any() else 0,
+        median_donor_distance=_hist_percentile(distance_hist, 50),
+        p90_donor_distance=_hist_percentile(distance_hist, 90),
+        mean_observations_per_recovered_pixel=(
+            observations_used / recovered_pixels if recovered_pixels else nan
+        ),
+        donor_fits=fits,
+        zero_offset_fallbacks=fallbacks,
+        peak_cached_frames=window.peak,
+    )
+
+
+# -- orchestration -------------------------------------------------------
+
+
+def composite_video_spatial_recovery(
+    source_path: Path,
+    replacement_path: Path,
+    source_matte_path: Path,
+    replacement_matte_path: Path,
+    output_path: Path,
+    *,
+    removal_threshold: int = SOURCE_REMOVAL_THRESHOLD,
+    dilation_radius: int = SOURCE_REMOVAL_DILATION_RADIUS,
+    background_threshold: int = SOURCE_BACKGROUND_THRESHOLD,
+    foreground_threshold: int = REPLACEMENT_FOREGROUND_THRESHOLD,
+    radius: int = TEMPORAL_RECOVERY_RADIUS,
+    max_observations: int = MAX_TEMPORAL_OBSERVATIONS,
+    crf: int = 16,
+    preset: str = "slow",
+) -> SpatialRecoveryCompositeReport:
+    """Composite four clips into one H.264 MP4 with temporal + spatial recovery.
+
+    Same four inputs, fail-closed validation, ``libvpx-vp9`` alpha decoding
+    and ffmpeg lifecycle as
+    :func:`video_character_skill.temporal_recovery.composite_video_temporal_recovery`;
+    the per-frame algorithm is the module docstring's.
+
+    Raises:
+        CompositeError: on an invalid parameter (checked before anything is
+            probed), any input mismatch, a matte without alpha, a stream that
+            ends early or late, or a failing ffmpeg process.
+    """
+    _check_int_range("removal_threshold", removal_threshold, 1, 255)
+    _check_radius(dilation_radius)
+    _check_int_range("background_threshold", background_threshold, 1, 255)
+    _check_int_range("foreground_threshold", foreground_threshold, 1, 255)
+    _check_int_range("radius", radius, 0, None)
+    _check_int_range("max_observations", max_observations, 1, None)
+    source, decodes = _probe_union_inputs(
+        source_path, replacement_path, source_matte_path, replacement_matte_path
+    )
+    pipeline = _ffmpeg_pipeline(decodes, output_path, source, crf=crf, preset=preset)
+    with pipeline as (pipes, encode):
+        stats = composite_streams_spatial_recovery(
+            pipes["source"],
+            pipes["replacement"],
+            pipes["source_matte"],
+            pipes["replacement_matte"],
+            encode,
+            width=source.width,
+            height=source.height,
+            frames=source.frame_count,
+            removal_threshold=removal_threshold,
+            dilation_radius=dilation_radius,
+            background_threshold=background_threshold,
+            foreground_threshold=foreground_threshold,
+            radius=radius,
+            max_observations=max_observations,
+        )
+
+    return SpatialRecoveryCompositeReport(
+        output_path=output_path,
+        frames=source.frame_count,
+        width=source.width,
+        height=source.height,
+        frame_rate=source.frame_rate,
+        removal_threshold=removal_threshold,
+        dilation_radius=dilation_radius,
+        background_threshold=background_threshold,
+        foreground_threshold=foreground_threshold,
+        radius=radius,
+        max_observations=max_observations,
+        stats=stats,
+    )

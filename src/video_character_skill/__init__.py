@@ -45,6 +45,11 @@ from video_character_skill.schemas import (
     VideoEditRequest,
     VideoMaskTrack,
 )
+from video_character_skill.spatial_recovery import (
+    SPATIAL_FILL_MARGIN,
+    SpatialRecoveryCompositeReport,
+    composite_video_spatial_recovery,
+)
 from video_character_skill.temporal_recovery import (
     MAX_TEMPORAL_OBSERVATIONS,
     REPLACEMENT_FOREGROUND_THRESHOLD,
@@ -61,12 +66,14 @@ __all__ = [
     "SOURCE_HARDEN_THRESHOLD",
     "SOURCE_REMOVAL_DILATION_RADIUS",
     "SOURCE_REMOVAL_THRESHOLD",
+    "SPATIAL_FILL_MARGIN",
     "TEMPORAL_RECOVERY_RADIUS",
     "CharacterOrientation",
     "CompositeError",
     "CompositeReport",
     "HardenedUnionCompositeReport",
     "SourceRemovalCompositeReport",
+    "SpatialRecoveryCompositeReport",
     "TemporalRecoveryCompositeReport",
     "MaskDecodeError",
     "DrivingVideo",
@@ -90,6 +97,7 @@ __all__ = [
     "composite_video",
     "composite_video_hardened_union",
     "composite_video_source_removal",
+    "composite_video_spatial_recovery",
     "composite_video_temporal_recovery",
     "composite_video_union",
     "decode_object_mask",
