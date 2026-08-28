@@ -45,16 +45,29 @@ from video_character_skill.schemas import (
     VideoEditRequest,
     VideoMaskTrack,
 )
+from video_character_skill.temporal_recovery import (
+    MAX_TEMPORAL_OBSERVATIONS,
+    REPLACEMENT_FOREGROUND_THRESHOLD,
+    SOURCE_BACKGROUND_THRESHOLD,
+    TEMPORAL_RECOVERY_RADIUS,
+    TemporalRecoveryCompositeReport,
+    composite_video_temporal_recovery,
+)
 
 __all__ = [
+    "MAX_TEMPORAL_OBSERVATIONS",
+    "REPLACEMENT_FOREGROUND_THRESHOLD",
+    "SOURCE_BACKGROUND_THRESHOLD",
     "SOURCE_HARDEN_THRESHOLD",
     "SOURCE_REMOVAL_DILATION_RADIUS",
     "SOURCE_REMOVAL_THRESHOLD",
+    "TEMPORAL_RECOVERY_RADIUS",
     "CharacterOrientation",
     "CompositeError",
     "CompositeReport",
     "HardenedUnionCompositeReport",
     "SourceRemovalCompositeReport",
+    "TemporalRecoveryCompositeReport",
     "MaskDecodeError",
     "DrivingVideo",
     "IdentityElement",
@@ -77,6 +90,7 @@ __all__ = [
     "composite_video",
     "composite_video_hardened_union",
     "composite_video_source_removal",
+    "composite_video_temporal_recovery",
     "composite_video_union",
     "decode_object_mask",
     "decode_rle",

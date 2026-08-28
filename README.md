@@ -256,6 +256,70 @@ print(composite_video_source_removal(
 ))"
 ```
 
+### Temporal real-background recovery (v5 POC)
+
+Visual QA of `composite_v4_removal.mp4` showed a background-coloured outline
+around the subject: v4 copies O1 pixels across the whole removal mask, and
+where the replacement person is absent those are O1's *regenerated*
+background. A read-only feasibility analysis found the camera is static (every
+6-frame background pair aligns at (0, 0) ± 1 px; whole-clip pairs agree within
+2–3 luma levels once a brightness offset is removed), that within ±24 frames
+81.5 % of the recovery region is real background at the same coordinates in
+some other frame (92.9 % over the whole clip; nearest observation a median
+2–3 frames away), that 19.8 % of it is already real background in its own
+frame, and that frames ~183–222 carry a white-balance/exposure shift rather
+than motion.
+
+`temporal_recovery.composite_video_temporal_recovery` therefore rebuilds the
+background plate from real source pixels before compositing (new module
+`temporal_recovery.py`; v1–v4 untouched):
+
+```
+removal           = source_removal_mask(source_alpha_i, 64, 4)          # v4
+recovery_region   = removal & (replacement_alpha_i < 128)
+own_background    = recovery_region & (source_alpha_i < 32)              # keep the source pixel
+needs_temporal    = recovery_region & ~own_background
+force_replacement = removal & (replacement_alpha_i >= 128)               # v4 protection
+
+for j in i-1, i+1, i-2, i+2, …, i-24, i+24:                             # nearest first, clipped
+    usable_j = source_alpha_j < 32
+    offset   = clamp(median over shared background of source_i - source_j, ±64)   # per channel
+    each needs_temporal pixel with usable_j takes clip(source_j + offset), until it holds 5
+
+background = source_i;  background[recovered]   = per-channel median of observations
+                        background[unrecovered] = replacement_i          # O1 fallback, never the old person
+effective_alpha = replacement_alpha_i;  effective_alpha[force_replacement] = 255
+output = composite_frame(background, replacement_i, effective_alpha)
+```
+
+Precedence inside the recovery region: own-frame real background, then
+temporally borrowed real background, then O1 background. Outside the removal
+mask nothing differs from plain replacement-matte compositing. No
+registration, optical flow, gain fitting, spatial inpainting or feathering.
+The source clip and matte are read 24 frames ahead and held in a window of at
+most 49 frames (~8.3 MB per 1080x1920 frame, ≈ 410 MB peak). A donor whose
+shared background is too small for a trustworthy offset (< 256 samples on a
+stride-8 grid) is used with zero offset, and the report counts those fits.
+The report also carries the recovery-region, own-background, recovered and
+unrecovered ratios (of the full frame), the O1-fallback share of the recovery
+region, median and p90 donor distance, mean observations per recovered pixel,
+and the peak cache size.
+
+To produce the v5 composite locally:
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from video_character_skill import composite_video_temporal_recovery
+print(composite_video_temporal_recovery(
+    Path('out/source_aligned_24fps.mp4'),
+    Path('out/o1_strict_prompt.mp4'),
+    Path('out/source_matte.webm'),
+    Path('out/o1_matte.webm'),
+    Path('out/composite_v5_recovery.mp4'),
+))"
+```
+
 ## Layout
 
 ```
@@ -271,6 +335,8 @@ src/video_character_skill/
   compositor.py              # alpha-composite the replacement onto the original;
                              # v1 single matte, v2 union, v3 hardened union,
                              # v4 source-removal mask (binary support + disk dilation)
+  temporal_recovery.py       # v5: real background borrowed from nearby source frames
+                             # inside the v4 mask, with additive photometric correction
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```
