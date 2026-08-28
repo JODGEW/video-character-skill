@@ -19,6 +19,13 @@ from video_character_skill.compositor import (
     source_removal_mask,
     union_alpha,
 )
+from video_character_skill.hard_inset_recovery import (
+    HARD_FOREGROUND_EROSION_RADIUS,
+    HARD_FOREGROUND_THRESHOLD,
+    HARD_INSET_REMOVAL_THRESHOLD,
+    HardInsetCompositeReport,
+    composite_video_hard_inset_recovery,
+)
 from video_character_skill.masks import (
     MaskDecodeError,
     decode_object_mask,
@@ -60,6 +67,9 @@ from video_character_skill.temporal_recovery import (
 )
 
 __all__ = [
+    "HARD_FOREGROUND_EROSION_RADIUS",
+    "HARD_FOREGROUND_THRESHOLD",
+    "HARD_INSET_REMOVAL_THRESHOLD",
     "MAX_TEMPORAL_OBSERVATIONS",
     "REPLACEMENT_FOREGROUND_THRESHOLD",
     "SOURCE_BACKGROUND_THRESHOLD",
@@ -71,6 +81,7 @@ __all__ = [
     "CharacterOrientation",
     "CompositeError",
     "CompositeReport",
+    "HardInsetCompositeReport",
     "HardenedUnionCompositeReport",
     "SourceRemovalCompositeReport",
     "SpatialRecoveryCompositeReport",
@@ -95,6 +106,7 @@ __all__ = [
     "VideoMaskTrack",
     "composite_frame",
     "composite_video",
+    "composite_video_hard_inset_recovery",
     "composite_video_hardened_union",
     "composite_video_source_removal",
     "composite_video_spatial_recovery",

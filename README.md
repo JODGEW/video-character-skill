@@ -387,6 +387,64 @@ print(composite_video_spatial_recovery(
 ))"
 ```
 
+### Hard-inset replacement foreground (v8 diagnostic POC)
+
+With source removal at 32/4 (v7) the old person no longer leaks, yet a thin
+hair-like contour remained around the head. Read-only attribution showed it is
+not the soft replacement alpha (its final seam equals the real-background
+control) and not our alpha forcing (no forcing/zeroing counterfactual removes
+more than ~6 % of the edge-light pixels): Kling O1 rendered the new person over
+its *own* regenerated background, so O1's anti-aliased edge RGB — the pixels
+VEED gives alpha 128–254 — already carries O1 background at any opacity.
+
+`hard_inset_recovery.composite_video_hard_inset_recovery` is a deliberately
+diagnostic composite that discards that edge entirely (new module
+`hard_inset_recovery.py`; v1–v7 untouched):
+
+```
+removal          = source_removal_mask(source_alpha_i, 32, 4)            # v7 parameters
+replacement_core = replacement_alpha_i >= 250
+hard_foreground  = erode_disk(replacement_core, 2)                        # outside the frame = background
+
+recovery_region  = removal & ~hard_foreground     # every old-person pixel the core will not cover
+own_background   = recovery_region & (source_alpha_i < 32)
+needs_temporal   = recovery_region & ~own_background
+… v5 temporal recovery, v6 spatial fill, O1 only for the unreachable residual …
+
+effective_alpha  = 255 where hard_foreground, 0 everywhere else           # binary
+output           = composite_frame(reconstructed_background, replacement_i, effective_alpha)
+```
+
+`erode_disk` uses the same integer Euclidean disk as `dilate_disk`
+(`dy² + dx² ≤ r²`); it is `NOT dilate_disk(NOT mask)` on a copy padded with
+background, so foreground touching the image border erodes normally and
+nothing wraps around. The recovery region is no longer
+`removal & (replacement_alpha < 128)`: the old person under the dropped alpha
+128–249 ring inside the removal mask is rebuilt from real background, so
+dropping the ring never exposes it. There is no `force_replacement`, no soft
+alpha and no feathering; the silhouette is harder and inset by 2 px on
+purpose. If the contour disappears, edge-RGB contamination is proven.
+
+The report carries the hard-foreground and dropped-alpha ratios, the v5/v6
+recovery and propagation diagnostics, and — to prove the old person was not
+exposed — the share of the dropped ring inside the removal mask resolved by
+own-frame, temporal, spatial and O1 background.
+
+To produce the v8 composite locally:
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from video_character_skill import composite_video_hard_inset_recovery
+print(composite_video_hard_inset_recovery(
+    Path('out/source_aligned_24fps.mp4'),
+    Path('out/o1_strict_prompt.mp4'),
+    Path('out/source_matte.webm'),
+    Path('out/o1_matte.webm'),
+    Path('out/composite_v8_hard_inset.mp4'),
+))"
+```
+
 ## Layout
 
 ```
@@ -406,6 +464,8 @@ src/video_character_skill/
                              # inside the v4 mask, with additive photometric correction
   spatial_recovery.py        # v6: v5's unrecovered pixels filled by synchronous-wave
                              # propagation from trusted real background, O1 last
+  hard_inset_recovery.py     # v8: eroded opaque replacement core only, dropped edge
+                             # rebuilt as real background (diagnostic)
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```
