@@ -115,6 +115,8 @@ SPATIAL_FILL_MARGIN = 1
 # The eight (dy, dx) neighbour offsets, in a fixed order (the order is
 # irrelevant to the result: each wave only sums over them).
 _NEIGHBOURS = tuple((dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0))
+_DY = np.array([dy for dy, _ in _NEIGHBOURS], dtype=np.int64)
+_DX = np.array([dx for _, dx in _NEIGHBOURS], dtype=np.int64)
 
 
 # -- results and reports -------------------------------------------------
@@ -283,6 +285,15 @@ def spatial_fill_component(
     other pixels of the crop, so nothing is read through replacement-person,
     old-person or O1 pixels. Stops when no unresolved pixel has a resolved
     neighbour; a component with no seed fills nothing.
+
+    The waves are evaluated on a sparse frontier: the pixels that can become
+    ready in wave ``k`` are exactly the unresolved component pixels
+    8-adjacent to the pixels resolved in wave ``k - 1`` (any pixel adjacent
+    to an older resolved pixel was already ready in an earlier wave), so
+    only those candidates are found (:func:`_wave_candidates`) and only
+    their own 8-neighbourhoods are summed (:func:`_fill_candidates`), against
+    the resolved mask as it stood before the wave. The work is proportional
+    to the component's pixels, not to its bounding box times its depth.
     """
     _check_rgb("rgb", rgb)
     _check_mask("trusted", trusted, rgb.shape[:2])
@@ -291,23 +302,26 @@ def spatial_fill_component(
         raise CompositeError("trusted and component overlap")
     resolved: BoolMask = trusted & _adjacent(component)
     seeds = int(np.count_nonzero(resolved))
+    width = component.shape[1]
     values = rgb.astype(np.int64)
     filled = np.zeros(component.shape, dtype=np.bool_)
     depth = np.zeros(component.shape, dtype=np.int32)
     unresolved = component.copy()
+    frontier: NDArray[np.int64] = np.flatnonzero(resolved).astype(np.int64)  # wave 0: the seeds
     wave = 0
-    while unresolved.any():
-        wave += 1
-        sums, counts = _neighbour_sums(values, resolved)
-        ready: BoolMask = unresolved & (counts > 0)
-        if not ready.any():
+    while frontier.size:
+        candidates = _wave_candidates(frontier, unresolved)
+        if candidates.size == 0:
             break
-        count = counts[ready][:, None]
-        values[ready] = (2 * sums[ready] + count) // (2 * count)
-        filled |= ready
-        depth[ready] = wave
-        resolved = resolved | ready  # only now: the next wave sees this wave's result
-        unresolved &= ~ready
+        wave += 1
+        new_values = _fill_candidates(values, resolved, candidates)  # previous wave's state
+        cy, cx = np.divmod(candidates, width)
+        values[cy, cx] = new_values  # committed together, after every candidate was computed
+        resolved[cy, cx] = True
+        unresolved[cy, cx] = False
+        filled[cy, cx] = True
+        depth[cy, cx] = wave
+        frontier = candidates
     out = rgb.copy()
     out[filled] = values[filled].astype(np.uint8)
     return ComponentFill(rgb=out, filled=filled, depth=depth, seeds=seeds)
@@ -439,19 +453,48 @@ def _adjacent(mask: BoolMask) -> BoolMask:
     return out
 
 
-def _neighbour_sums(
-    values: NDArray[np.int64], resolved: BoolMask
-) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    """Per-pixel sum of resolved 8-neighbours' RGB and how many there were."""
+def _wave_candidates(frontier: NDArray[np.int64], unresolved: BoolMask) -> NDArray[np.int64]:
+    """Flat indices of unresolved pixels 8-adjacent to ``frontier``, unique and sorted.
+
+    ``frontier`` holds flat indices into ``unresolved``'s shape. Neighbours
+    outside the image are dropped. Duplicates (a pixel next to several
+    frontier pixels) are collapsed, so each candidate is evaluated once, in
+    a fixed order.
+    """
+    height, width = unresolved.shape
+    fy, fx = np.divmod(frontier, width)
+    ny = (fy[:, None] + _DY[None, :]).ravel()
+    nx = (fx[:, None] + _DX[None, :]).ravel()
+    inside = (ny >= 0) & (ny < height) & (nx >= 0) & (nx < width)
+    flat = ny[inside] * width + nx[inside]
+    flat = flat[unresolved.reshape(-1)[flat]]
+    unique: NDArray[np.int64] = np.unique(flat).astype(np.int64)
+    return unique
+
+
+def _fill_candidates(
+    values: NDArray[np.int64], resolved: BoolMask, candidates: NDArray[np.int64]
+) -> NDArray[np.int64]:
+    """``(n, 3)`` rounded-half-up means of each candidate's resolved 8-neighbours.
+
+    Reads ``resolved`` and ``values`` as they are — the caller commits the
+    result afterwards, so every candidate of one wave sees the same state.
+    Neighbours outside the image never contribute.
+    """
     height, width = resolved.shape
-    sums = np.zeros((height, width, 3), dtype=np.int64)
-    counts = np.zeros((height, width), dtype=np.int64)
-    masked = values * resolved[:, :, None]
-    for dy, dx in _NEIGHBOURS:
-        to, frm = _shifted(dy, dx, height, width)
-        sums[to] += masked[frm]
-        counts[to] += resolved[frm]
-    return sums, counts
+    cy, cx = np.divmod(candidates, width)
+    ny = cy[:, None] + _DY[None, :]
+    nx = cx[:, None] + _DX[None, :]
+    inside = (ny >= 0) & (ny < height) & (nx >= 0) & (nx < width)
+    ny_c = np.clip(ny, 0, height - 1)
+    nx_c = np.clip(nx, 0, width - 1)
+    contributes = inside & resolved[ny_c, nx_c]
+    counts = contributes.sum(axis=1, dtype=np.int64)
+    if bool((counts == 0).any()):
+        raise CompositeError("candidate without a resolved neighbour")
+    sums = (values[ny_c, nx_c] * contributes[:, :, None]).sum(axis=1, dtype=np.int64)
+    means: NDArray[np.int64] = (2 * sums + counts[:, None]) // (2 * counts[:, None])
+    return means
 
 
 def _shifted(
