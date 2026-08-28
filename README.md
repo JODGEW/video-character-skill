@@ -161,6 +161,50 @@ print(composite_video_union(
 ))"
 ```
 
+### Source-matte hardening (v3 POC)
+
+Visual QA of `composite_v2_union.mp4` still showed the old person's hair
+ghosting through. The union keeps the *source* matte's partial alpha inside
+`source_only`, and a read-only sweep found that alpha is not near-opaque: the
+mean residual source contribution there is 14.0 %, spread over a broad tail
+(13 % of those pixels at alpha 128–159, 13 % at 160–191, only 20 % at exactly
+255). Hardening only near-opaque pixels buys little — thresholds of 208–240
+leave 11–13 % residual — so the v3 rule hardens at **160**:
+
+```
+effective = max(source_alpha, replacement_alpha)
+harden    = (source_alpha >= 160) & (source_alpha > replacement_alpha)
+effective[harden] = 255
+```
+
+`compositor.composite_video_hardened_union` applies exactly that on top of the
+v2 pipeline (same four inputs, same fail-closed validation, same `libvpx-vp9`
+alpha decoding, same streaming). On the real mattes it hardens 87 % of
+`source_only` (residual 14.0 % → 5.7 %), changes 0.33 % of the frame on average
+(max 0.89 %), and overrides about a fifth of the replacement matte's soft
+edge, nearly all of it where the source matte is ≥ 240 anyway. What survives
+is the source matte's own 1–2 px anti-aliased rim — a thin outline, not a
+patch. The replacement matte is never thresholded, the source matte is only
+hardened where it is *more confident than the replacement*, and there is still
+no dilation, feathering or inpainting; `source_only` pixels still come from
+the O1 clip. The report adds `hardened_ratio`: the mean fraction of the frame
+the rule actually changed to 255 (pixels already at 255 are not counted).
+
+To produce the v3 composite locally:
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from video_character_skill import composite_video_hardened_union
+print(composite_video_hardened_union(
+    Path('out/source_aligned_24fps.mp4'),
+    Path('out/o1_strict_prompt.mp4'),
+    Path('out/source_matte.webm'),
+    Path('out/o1_matte.webm'),
+    Path('out/composite_v3_hardened.mp4'),
+))"
+```
+
 ## Layout
 
 ```
@@ -174,7 +218,7 @@ src/video_character_skill/
   providers/fal_sam3.py      # SAM 3 per-object video segmentation (superseded)
   providers/fal_veed_matting.py  # VEED background removal -> alpha matte
   compositor.py              # alpha-composite the replacement onto the original;
-                             # v1 single matte, v2 union of source + replacement mattes
+                             # v1 single matte, v2 union of both mattes, v3 hardened union
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```

@@ -1,12 +1,16 @@
 """Transfer a reference person's appearance onto a driving video's motion."""
 
 from video_character_skill.compositor import (
+    SOURCE_HARDEN_THRESHOLD,
     CompositeError,
     CompositeReport,
+    HardenedUnionCompositeReport,
     UnionCompositeReport,
     composite_frame,
     composite_video,
+    composite_video_hardened_union,
     composite_video_union,
+    hardened_union_alpha,
     union_alpha,
 )
 from video_character_skill.masks import (
@@ -37,9 +41,11 @@ from video_character_skill.schemas import (
 )
 
 __all__ = [
+    "SOURCE_HARDEN_THRESHOLD",
     "CharacterOrientation",
     "CompositeError",
     "CompositeReport",
+    "HardenedUnionCompositeReport",
     "MaskDecodeError",
     "DrivingVideo",
     "IdentityElement",
@@ -60,9 +66,11 @@ __all__ = [
     "VideoMaskTrack",
     "composite_frame",
     "composite_video",
+    "composite_video_hardened_union",
     "composite_video_union",
     "decode_object_mask",
     "decode_rle",
+    "hardened_union_alpha",
     "mask_area_ratio",
     "mask_bbox",
     "union_alpha",

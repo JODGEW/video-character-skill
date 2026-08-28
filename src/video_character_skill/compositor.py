@@ -84,6 +84,33 @@ mattes are used exactly as decoded — no thresholding, dilation, feathering or
 inpainting — and :func:`composite_frame` is reused unchanged, so the
 ``alpha == 0`` / ``alpha == 255`` byte-copy guarantee above holds for the
 *effective* alpha.
+
+Source-matte hardening (v3 POC)
+-------------------------------
+Visual QA of the union composite still showed the old person's hair ghosting
+through. The union keeps the *source* matte's partial alpha inside
+``source_only``, and that alpha is not near-opaque: a read-only sweep found a
+mean residual source contribution of 14.0 % there, spread over a broad tail
+(13 % of those pixels at alpha 128-159, 13 % at 160-191, only 20 % at exactly
+255). Hardening only near-opaque pixels therefore buys little — thresholds of
+208-240 leave 11-13 % residual.
+
+:func:`composite_video_hardened_union` applies one extra rule on top of the
+union, with :data:`SOURCE_HARDEN_THRESHOLD` = 160::
+
+    effective = max(source_alpha, replacement_alpha)
+    harden = (source_alpha >= 160) & (source_alpha > replacement_alpha)
+    effective[harden] = 255
+
+On the real mattes that hardens 87 % of ``source_only`` (residual 14.0 % ->
+5.7 %), changes 0.33 % of the frame on average (max 0.89 %), and overrides
+about a fifth of the replacement matte's soft edge — nearly all of it where
+the source matte is >= 240 anyway. What survives is the source matte's own
+1-2 px anti-aliased rim (87 % of the remaining pixels lie within 2 px of the
+source silhouette): a thin outline rather than a patch. The replacement matte
+is never thresholded, the source matte is hardened only where it is *more
+confident than the replacement*, and there is still no dilation, feathering
+or inpainting; ``source_only`` pixels still come from the O1 clip.
 """
 
 from __future__ import annotations
@@ -103,16 +130,22 @@ from numpy.typing import NDArray
 __all__ = [
     "ALPHA_DECODERS",
     "ALPHA_PIX_FMTS",
+    "SOURCE_HARDEN_THRESHOLD",
     "CompositeError",
     "CompositeReport",
+    "HardenedUnionCompositeReport",
+    "HardenedUnionStreamStats",
     "UnionCompositeReport",
     "UnionStreamStats",
     "VideoInfo",
     "composite_frame",
     "composite_streams",
+    "composite_streams_hardened_union",
     "composite_streams_union",
     "composite_video",
+    "composite_video_hardened_union",
     "composite_video_union",
+    "hardened_union_alpha",
     "probe_video",
     "soft_edge_ratio",
     "union_alpha",
@@ -142,6 +175,11 @@ ALPHA_PIX_FMTS = frozenset(
         "ya8", "ya16le",
     }
 )
+
+# Source-matte hardening threshold for the v3 composite. Chosen from a
+# read-only sweep over {160, 192, 208, 224, 240}: the only candidate that
+# materially removed the old person's ghosting. See the module docstring.
+SOURCE_HARDEN_THRESHOLD = 160
 
 
 class CompositeError(RuntimeError):
@@ -214,6 +252,38 @@ class UnionCompositeReport:
     """See :attr:`UnionStreamStats.soft_edge_ratio`."""
     union_lift_ratio: float
     """See :attr:`UnionStreamStats.union_lift_ratio`."""
+
+
+@dataclass(frozen=True)
+class HardenedUnionStreamStats:
+    """Per-clip means gathered while streaming a hardened dual-matte composite."""
+
+    soft_edge_ratio: float
+    """Mean fraction of pixels per frame blended under the *effective* alpha."""
+    union_lift_ratio: float
+    """As :attr:`UnionStreamStats.union_lift_ratio`: source alpha above the
+    replacement's, before hardening."""
+    hardened_ratio: float
+    """Mean fraction of full-frame pixels per frame that the hardening rule
+    actually changed to 255 — pixels whose plain-union alpha was below 255 and
+    met the rule. Pixels already at 255 are not counted."""
+
+
+@dataclass(frozen=True)
+class HardenedUnionCompositeReport:
+    """What one hardened dual-matte composite run produced."""
+
+    output_path: Path
+    frames: int
+    width: int
+    height: int
+    frame_rate: Fraction
+    source_threshold: int
+    """The hardening threshold that was applied."""
+    soft_edge_ratio: float
+    union_lift_ratio: float
+    hardened_ratio: float
+    """See :class:`HardenedUnionStreamStats` for the three ratios."""
 
 
 # -- the pure part -------------------------------------------------------
@@ -300,6 +370,62 @@ def union_alpha(source_alpha: AlphaPlane, replacement_alpha: AlphaPlane) -> Alph
     _check_alphas(source_alpha, replacement_alpha)
     out: AlphaPlane = np.maximum(source_alpha, replacement_alpha)
     return out
+
+
+def hardened_union_alpha(
+    source_alpha: AlphaPlane,
+    replacement_alpha: AlphaPlane,
+    *,
+    source_threshold: int = SOURCE_HARDEN_THRESHOLD,
+) -> AlphaPlane:
+    """Union of two mattes, with confident source pixels forced opaque. Pure.
+
+    Args:
+        source_alpha: ``(H, W)`` uint8 matte of the person in the *source* clip.
+        replacement_alpha: ``(H, W)`` uint8 matte of the person in the
+            *replacement* clip.
+        source_threshold: source alpha at or above which a pixel is hardened,
+            ``1..255``. Defaults to :data:`SOURCE_HARDEN_THRESHOLD`.
+
+    Returns:
+        A new ``(H, W)`` uint8 plane. Exactly::
+
+            effective = np.maximum(source_alpha, replacement_alpha)
+            harden = (source_alpha >= source_threshold) & (source_alpha > replacement_alpha)
+            effective[harden] = 255
+
+    Raises:
+        CompositeError: on mismatched shapes, a non-2-D plane, a non-uint8
+            input, or a threshold outside ``1..255``.
+
+    The rule never lowers a pixel below the plain union, and it never fires
+    where the replacement matte is at least as confident as the source — so
+    the replacement's own soft edge stands wherever it is the stronger
+    opinion. The replacement matte is not thresholded, and the source matte is
+    not thresholded globally: a source pixel below the threshold keeps its
+    partial value through the union exactly as before.
+    """
+    _check_alphas(source_alpha, replacement_alpha)
+    _check_threshold(source_threshold)
+    out: AlphaPlane = np.maximum(source_alpha, replacement_alpha)
+    out[_harden_mask(source_alpha, replacement_alpha, source_threshold)] = 255
+    return out
+
+
+def _harden_mask(
+    source_alpha: AlphaPlane, replacement_alpha: AlphaPlane, source_threshold: int
+) -> NDArray[np.bool_]:
+    mask: NDArray[np.bool_] = (source_alpha >= source_threshold) & (
+        source_alpha > replacement_alpha
+    )
+    return mask
+
+
+def _check_threshold(source_threshold: int) -> None:
+    if isinstance(source_threshold, bool) or not isinstance(source_threshold, int):
+        raise CompositeError(f"source_threshold must be an int, got {source_threshold!r}")
+    if not 1 <= source_threshold <= 255:
+        raise CompositeError(f"source_threshold must be in 1..255, got {source_threshold}")
 
 
 def _check_alphas(source_alpha: AlphaPlane, replacement_alpha: AlphaPlane) -> None:
@@ -432,6 +558,77 @@ def composite_streams_union(
         return UnionStreamStats(soft_edge_ratio=0.0, union_lift_ratio=0.0)
     return UnionStreamStats(
         soft_edge_ratio=soft_total / frames, union_lift_ratio=lift_total / frames
+    )
+
+
+def composite_streams_hardened_union(
+    source: IO[bytes],
+    replacement: IO[bytes],
+    source_matte: IO[bytes],
+    replacement_matte: IO[bytes],
+    output: IO[bytes],
+    *,
+    width: int,
+    height: int,
+    frames: int,
+    source_threshold: int = SOURCE_HARDEN_THRESHOLD,
+) -> HardenedUnionStreamStats:
+    """Composite ``frames`` frames under the hardened union, one at a time.
+
+    As :func:`composite_streams_union`, but per frame::
+
+        effective_alpha = hardened_union_alpha(
+            source_alpha, replacement_alpha, source_threshold=source_threshold
+        )
+        output_frame = composite_frame(source_rgb, replacement_rgb, effective_alpha)
+
+    Returns:
+        :class:`HardenedUnionStreamStats` with the clip's mean ratios.
+
+    Raises:
+        CompositeError: if the threshold is out of range (before anything is
+            read), if any of the four streams ends before ``frames`` frames,
+            or if any still has data afterwards.
+    """
+    _check_threshold(source_threshold)
+    soft_total = 0.0
+    lift_total = 0.0
+    hardened_total = 0.0
+
+    for index in range(frames):
+        source_frame = _read_rgb_frame(source, "source", index, width, height)
+        replacement_frame = _read_rgb_frame(replacement, "replacement", index, width, height)
+        source_alpha = _read_alpha_frame(source_matte, "source_matte", index, width, height)
+        replacement_alpha = _read_alpha_frame(
+            replacement_matte, "replacement_matte", index, width, height
+        )
+
+        union = union_alpha(source_alpha, replacement_alpha)
+        alpha = hardened_union_alpha(
+            source_alpha, replacement_alpha, source_threshold=source_threshold
+        )
+        size = float(alpha.size)
+        soft_total += soft_edge_ratio(alpha)
+        lift_total += float(np.count_nonzero(source_alpha > replacement_alpha)) / size
+        hardened_total += float(np.count_nonzero(alpha != union)) / size
+        output.write(composite_frame(source_frame, replacement_frame, alpha).tobytes())
+
+    _assert_drained(
+        {
+            "source": source,
+            "replacement": replacement,
+            "source_matte": source_matte,
+            "replacement_matte": replacement_matte,
+        },
+        frames,
+    )
+
+    if not frames:
+        return HardenedUnionStreamStats(0.0, 0.0, 0.0)
+    return HardenedUnionStreamStats(
+        soft_edge_ratio=soft_total / frames,
+        union_lift_ratio=lift_total / frames,
+        hardened_ratio=hardened_total / frames,
     )
 
 
@@ -687,22 +884,9 @@ def composite_video_union(
     ``effective_alpha == 255`` pixels the replacement's, pre-encode. See the
     module docstring for what the union trades away.
     """
-    source = probe_video(source_path)
-    replacement = probe_video(replacement_path)
-    source_matte = _probe_matte(source_matte_path)
-    replacement_matte = _probe_matte(replacement_matte_path)
-    _validate_union(source, replacement, source_matte, replacement_matte)
-
-    decodes = {
-        "source": _Decode(source_path, "rgb24", None),
-        "replacement": _Decode(replacement_path, "rgb24", None),
-        "source_matte": _Decode(
-            source_matte_path, "rgba", ALPHA_DECODERS.get(source_matte.codec_name)
-        ),
-        "replacement_matte": _Decode(
-            replacement_matte_path, "rgba", ALPHA_DECODERS.get(replacement_matte.codec_name)
-        ),
-    }
+    source, decodes = _probe_union_inputs(
+        source_path, replacement_path, source_matte_path, replacement_matte_path
+    )
     pipeline = _ffmpeg_pipeline(decodes, output_path, source, crf=crf, preset=preset)
     with pipeline as (pipes, encode):
         stats = composite_streams_union(
@@ -725,6 +909,103 @@ def composite_video_union(
         soft_edge_ratio=stats.soft_edge_ratio,
         union_lift_ratio=stats.union_lift_ratio,
     )
+
+
+def composite_video_hardened_union(
+    source_path: Path,
+    replacement_path: Path,
+    source_matte_path: Path,
+    replacement_matte_path: Path,
+    output_path: Path,
+    *,
+    source_threshold: int = SOURCE_HARDEN_THRESHOLD,
+    crf: int = 16,
+    preset: str = "slow",
+) -> HardenedUnionCompositeReport:
+    """Composite four clips into one H.264 MP4 under the hardened union.
+
+    As :func:`composite_video_union` — same four inputs, same fail-closed
+    validation, same ``libvpx-vp9`` alpha decoding, same streaming — but the
+    effective alpha is :func:`hardened_union_alpha` with ``source_threshold``.
+
+    Args:
+        source_path: the original footage.
+        replacement_path: the edited footage (Kling O1).
+        source_matte_path: matte of the person in the *source* clip.
+        replacement_matte_path: matte of the person in the *replacement* clip.
+        output_path: the ``.mp4`` to write.
+        source_threshold: see :func:`hardened_union_alpha`. Defaults to
+            :data:`SOURCE_HARDEN_THRESHOLD`.
+        crf: x264 quality, as for :func:`composite_video`.
+        preset: x264 speed/efficiency preset.
+
+    Returns:
+        A :class:`HardenedUnionCompositeReport`; its ``hardened_ratio`` is the
+        mean fraction of the frame the rule actually changed.
+
+    Raises:
+        CompositeError: as :func:`composite_video_union`, or if the threshold
+            is outside ``1..255`` (checked before anything is probed).
+    """
+    _check_threshold(source_threshold)
+    source, decodes = _probe_union_inputs(
+        source_path, replacement_path, source_matte_path, replacement_matte_path
+    )
+    pipeline = _ffmpeg_pipeline(decodes, output_path, source, crf=crf, preset=preset)
+    with pipeline as (pipes, encode):
+        stats = composite_streams_hardened_union(
+            pipes["source"],
+            pipes["replacement"],
+            pipes["source_matte"],
+            pipes["replacement_matte"],
+            encode,
+            width=source.width,
+            height=source.height,
+            frames=source.frame_count,
+            source_threshold=source_threshold,
+        )
+
+    return HardenedUnionCompositeReport(
+        output_path=output_path,
+        frames=source.frame_count,
+        width=source.width,
+        height=source.height,
+        frame_rate=source.frame_rate,
+        source_threshold=source_threshold,
+        soft_edge_ratio=stats.soft_edge_ratio,
+        union_lift_ratio=stats.union_lift_ratio,
+        hardened_ratio=stats.hardened_ratio,
+    )
+
+
+def _probe_union_inputs(
+    source_path: Path,
+    replacement_path: Path,
+    source_matte_path: Path,
+    replacement_matte_path: Path,
+) -> tuple[VideoInfo, dict[str, _Decode]]:
+    """Probe and validate the four dual-matte inputs; say how to decode each.
+
+    Shared by the union and hardened-union composites so both fail closed on
+    exactly the same conditions, before any ffmpeg process is spawned.
+    """
+    source = probe_video(source_path)
+    replacement = probe_video(replacement_path)
+    source_matte = _probe_matte(source_matte_path)
+    replacement_matte = _probe_matte(replacement_matte_path)
+    _validate_union(source, replacement, source_matte, replacement_matte)
+
+    decodes = {
+        "source": _Decode(source_path, "rgb24", None),
+        "replacement": _Decode(replacement_path, "rgb24", None),
+        "source_matte": _Decode(
+            source_matte_path, "rgba", ALPHA_DECODERS.get(source_matte.codec_name)
+        ),
+        "replacement_matte": _Decode(
+            replacement_matte_path, "rgba", ALPHA_DECODERS.get(replacement_matte.codec_name)
+        ),
+    }
+    return source, decodes
 
 
 @dataclass(frozen=True)
