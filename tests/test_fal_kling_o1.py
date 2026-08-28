@@ -9,11 +9,13 @@ from typing import Any
 
 import fal_client
 import pytest
+from pydantic import ValidationError
 
 from fal_fakes import COMPLETED_OK, SUCCESS_PAYLOAD, FakeFalClient
 from video_character_skill.providers.base import ProviderError
 from video_character_skill.providers.fal_kling_o1 import (
     APP_ID,
+    MAX_ELEMENT_REFERENCE_IMAGES,
     MAX_PROMPT_CHARS,
     FalKlingO1EditProvider,
 )
@@ -55,7 +57,12 @@ def test_default_payload_matches_o1_schema() -> None:
         "prompt": DEFAULT_PROMPT,
         "video_url": "https://example.com/source.mp4",
         "keep_audio": True,
-        "elements": [{"frontal_image_url": "https://example.com/ref.png"}],
+        "elements": [
+            {
+                "frontal_image_url": "https://example.com/ref.png",
+                "reference_image_urls": ["https://example.com/ref.png"],
+            }
+        ],
     }
     assert "image_urls" not in arguments
     assert "image_url" not in arguments
@@ -157,7 +164,12 @@ def test_explicit_frontal_image_overrides_the_reference_image() -> None:
     )
 
     _, arguments = fake.submissions[0]
-    assert arguments["elements"] == [{"frontal_image_url": "https://example.com/face.png"}]
+    assert arguments["elements"] == [
+        {
+            "frontal_image_url": "https://example.com/face.png",
+            "reference_image_urls": ["https://example.com/face.png"],
+        }
+    ]
 
 
 # -- uploads ------------------------------------------------------------
@@ -188,6 +200,11 @@ def test_local_video_and_reference_image_are_uploaded(local_media: tuple[Path, P
     assert arguments["elements"][0]["frontal_image_url"] == (
         "https://v3.fal.media/files/reference_image.png"
     )
+    # the frontal image doubles as the single reference entry, uploaded once
+    assert arguments["elements"][0]["reference_image_urls"] == [
+        "https://v3.fal.media/files/reference_image.png"
+    ]
+    assert fake.uploads.count(str(image)) == 1
 
 
 def test_local_element_and_style_images_are_uploaded(
@@ -405,3 +422,116 @@ def test_upload_failure_becomes_provider_error(local_media: tuple[Path, Path]) -
                 driving_video=DrivingVideo(uri=str(video)),
             )
         )
+
+
+# -- regression: elementReferList size must be between 1 and 3 ----------
+#
+# Job 01a046a5-c69b-7272-a6e8-a924a8c36b36 was reported Completed by the queue,
+# then failed at result() with HTTP 422 "elementReferList: size must be between
+# 1 and 3". Its element carried a frontal_image_url with reference_image_urls
+# omitted. The published OpenAPI schema marks that field optional; the backend
+# does not.
+
+
+def test_single_reference_image_never_yields_an_empty_reference_list() -> None:
+    """The exact request shape that produced the 422."""
+    fake = FakeFalClient()
+    FalKlingO1EditProvider(client=fake).submit(
+        VideoEditRequest(
+            reference_image=ReferenceImage(uri="https://example.com/reference_image.png"),
+            driving_video=DrivingVideo(
+                uri="https://example.com/driving_video_o1.mp4", duration_seconds=9.5
+            ),
+        )
+    )
+
+    _, arguments = fake.submissions[0]
+    element = arguments["elements"][0]
+    assert element["reference_image_urls"] == ["https://example.com/reference_image.png"]
+    assert element["reference_image_urls"] != []
+    assert len(element["reference_image_urls"]) == 1
+
+
+@pytest.mark.parametrize(
+    "request_builder",
+    [
+        pytest.param(lambda: edit_request(), id="no-element"),
+        pytest.param(
+            lambda: edit_request(
+                identity_element=IdentityElement(
+                    frontal_image=ReferenceImage(uri="https://example.com/face.png")
+                )
+            ),
+            id="element-frontal-only",
+        ),
+        pytest.param(
+            lambda: edit_request(
+                identity_element=IdentityElement(
+                    additional_images=(ReferenceImage(uri="https://example.com/a.png"),)
+                )
+            ),
+            id="element-angles-only",
+        ),
+        pytest.param(
+            lambda: edit_request(
+                style_images=(ReferenceImage(uri="https://example.com/outfit.png"),)
+            ),
+            id="with-style-images",
+        ),
+    ],
+)
+def test_reference_image_urls_is_always_present_and_sized_one_to_three(
+    request_builder: Any,
+) -> None:
+    fake = FakeFalClient()
+    FalKlingO1EditProvider(client=fake).submit(request_builder())
+
+    _, arguments = fake.submissions[0]
+    element = arguments["elements"][0]
+    assert "reference_image_urls" in element
+    assert 1 <= len(element["reference_image_urls"]) <= 3
+
+
+def test_explicit_additional_images_are_used_as_the_reference_list() -> None:
+    fake = FakeFalClient()
+    FalKlingO1EditProvider(client=fake).submit(
+        edit_request(
+            identity_element=IdentityElement(
+                additional_images=(
+                    ReferenceImage(uri="https://example.com/face-left.png"),
+                    ReferenceImage(uri="https://example.com/face-right.png"),
+                    ReferenceImage(uri="https://example.com/face-up.png"),
+                )
+            )
+        )
+    )
+
+    _, arguments = fake.submissions[0]
+    assert arguments["elements"][0] == {
+        "frontal_image_url": "https://example.com/ref.png",
+        "reference_image_urls": [
+            "https://example.com/face-left.png",
+            "https://example.com/face-right.png",
+            "https://example.com/face-up.png",
+        ],
+    }
+
+
+def test_more_than_three_reference_images_fails_before_upload_or_submit() -> None:
+    fake = FakeFalClient()
+    angles = tuple(ReferenceImage(uri=f"https://example.com/face-{i}.png") for i in range(4))
+
+    with pytest.raises(ValidationError):
+        edit_request(identity_element=IdentityElement(additional_images=angles))
+
+    assert fake.uploads == []
+    assert fake.submissions == []
+
+
+def test_provider_also_guards_the_reference_list_size() -> None:
+    """Defence in depth: the provider enforces the rule independently of the model."""
+    with pytest.raises(ProviderError, match="elementReferList"):
+        FalKlingO1EditProvider._check_reference_images(MAX_ELEMENT_REFERENCE_IMAGES + 1)
+
+    FalKlingO1EditProvider._check_reference_images(MAX_ELEMENT_REFERENCE_IMAGES)
+    FalKlingO1EditProvider._check_reference_images(0)  # frontal-image fallback

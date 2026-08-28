@@ -27,6 +27,24 @@ unlike the Motion Control variant of this type::
     reference_image_urls  optional  "Additional reference images from different
                                      angles. 1-3 images supported."
 
+Observed backend constraint (NOT in the published OpenAPI schema)
+-----------------------------------------------------------------
+The spec marks ``reference_image_urls`` optional, but the backend rejects an
+element without it. Job ``01a046a5-c69b-7272-a6e8-a924a8c36b36`` was reported
+``Completed`` by the queue, and fetching its result returned HTTP 422::
+
+    elementReferList: size must be between 1 and 3
+
+That job's element had been submitted with ``frontal_image_url`` set and
+``reference_image_urls`` *omitted* — so omitting the key is not a workaround;
+the backend materializes it as an empty list and then enforces size 1-3.
+:meth:`FalKlingO1EditProvider._element_payload` therefore always emits 1-3
+entries, falling back to the frontal image itself when no other angle is given.
+
+Note also that the failure surfaced only at ``result()``: the queue still
+reported the job as completed, so a caller must not treat "completed" as
+"succeeded" without fetching the result.
+
 The reference person is bound as ``elements[0]`` and referenced from the prompt
 as ``@Element1``; any :attr:`VideoEditRequest.style_images` become
 ``image_urls`` and are referenced as ``@Image1`` onward.
@@ -47,6 +65,8 @@ from video_character_skill.schemas import (
 __all__ = [
     "APP_ID",
     "MAX_DURATION_SECONDS",
+    "MAX_ELEMENT_REFERENCE_IMAGES",
+    "MIN_ELEMENT_REFERENCE_IMAGES",
     "MAX_PROMPT_CHARS",
     "MAX_REFERENCES",
     "MIN_DURATION_SECONDS",
@@ -62,6 +82,11 @@ MIN_DURATION_SECONDS = 3.0
 MAX_DURATION_SECONDS = 10.05
 MAX_PROMPT_CHARS = 2500
 MAX_REFERENCES = 4  # elements + image_urls combined
+
+# Observed backend rule, absent from the published schema: an element's
+# reference_image_urls must hold 1-3 entries. See the module docstring.
+MIN_ELEMENT_REFERENCE_IMAGES = 1
+MAX_ELEMENT_REFERENCE_IMAGES = 3
 
 
 class FalKlingO1EditProvider(FalQueueProvider):
@@ -103,6 +128,11 @@ class FalKlingO1EditProvider(FalQueueProvider):
 
         ``reference_image`` is the frontal (main) view unless an explicit
         identity element overrides it; the element's other angles ride along.
+
+        ``reference_image_urls`` is always populated with 1-3 entries — see the
+        observed backend constraint in the module docstring. With only one
+        reference image available, the frontal image doubles as the single
+        entry, reusing its already-resolved URL rather than uploading twice.
         """
         element = request.identity_element
         frontal: ReferenceImage = request.reference_image
@@ -112,12 +142,17 @@ class FalKlingO1EditProvider(FalQueueProvider):
                 frontal = element.frontal_image
             additional = element.additional_images
 
-        payload: dict[str, Any] = {"frontal_image_url": self._resolve_url(frontal)}
-        if additional:
-            payload["reference_image_urls"] = [
-                self._resolve_url(image) for image in additional
-            ]
-        return payload
+        self._check_reference_images(len(additional))
+        frontal_url = self._resolve_url(frontal)
+        reference_urls = (
+            [self._resolve_url(image) for image in additional]
+            if additional
+            else [frontal_url]
+        )
+        return {
+            "frontal_image_url": frontal_url,
+            "reference_image_urls": reference_urls,
+        }
 
     # -- the instruction -----------------------------------------------
 
@@ -155,6 +190,20 @@ class FalKlingO1EditProvider(FalQueueProvider):
             raise ProviderError(
                 f"{total} references (1 element + {style_image_count} images) exceeds "
                 f"the maximum of {MAX_REFERENCES}"
+            )
+
+    @staticmethod
+    def _check_reference_images(count: int) -> None:
+        """Enforce the backend's ``elementReferList`` size rule.
+
+        ``count`` is the number of *explicit* extra angles; zero is fine because
+        the frontal image is used as the single entry in that case.
+        """
+        if count > MAX_ELEMENT_REFERENCE_IMAGES:
+            raise ProviderError(
+                f"{count} element reference images; the backend accepts "
+                f"{MIN_ELEMENT_REFERENCE_IMAGES}-{MAX_ELEMENT_REFERENCE_IMAGES} "
+                "(elementReferList)"
             )
 
     @staticmethod
