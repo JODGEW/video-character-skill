@@ -1,5 +1,11 @@
 """Transfer a reference person's appearance onto a driving video's motion."""
 
+from video_character_skill.compositor import (
+    CompositeError,
+    CompositeReport,
+    composite_frame,
+    composite_video,
+)
 from video_character_skill.masks import (
     MaskDecodeError,
     decode_object_mask,
@@ -29,6 +35,8 @@ from video_character_skill.schemas import (
 
 __all__ = [
     "CharacterOrientation",
+    "CompositeError",
+    "CompositeReport",
     "MaskDecodeError",
     "DrivingVideo",
     "IdentityElement",
@@ -46,6 +54,8 @@ __all__ = [
     "TransferRequest",
     "VideoEditRequest",
     "VideoMaskTrack",
+    "composite_frame",
+    "composite_video",
     "decode_object_mask",
     "decode_rle",
     "mask_area_ratio",

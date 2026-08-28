@@ -29,8 +29,9 @@ queue, all covered in tests by fakes only:
 | `FalSam3VideoMaskProvider` | `fal-ai/sam-3/video-rle-objects` | per-frame RLE masks; **rejected as the matte source, see below** |
 | `FalVeedMattingProvider` | `veed/video-background-removal` | the person matte: one VP9/WebM with an alpha channel |
 
-Nothing composites yet: the providers only fetch a matte. There is no polling
-loop and no retry logic; the caller polls `get_status` itself.
+`compositor.py` puts the original background back; it has not been run on the
+real clips yet. There is no polling loop and no retry logic; the caller polls
+`get_status` itself.
 
 Temporal alignment between `out/source_aligned_24fps.mp4` and
 `out/o1_strict_prompt.mp4` has been QA'd and passes — both are 1080x1920, 24 fps,
@@ -82,6 +83,37 @@ no tracking. `sam-3/video-rle-objects` returns, per frame, one RLE mask per
 tracked object plus a track id that is stable across the whole clip. See
 `providers/fal_sam3.py` for the full comparison and the verbatim schemas.
 
+## Compositing
+
+`compositor.composite_video` streams three clips through ffmpeg pipes and
+writes one MP4:
+
+```
+output = alpha * replacement + (1 - alpha) * source
+```
+
+Pixels are partitioned by matte alpha rather than blended uniformly. The output
+buffer starts as a copy of the source frame, so **`alpha == 0` pixels are
+preserved by construction** — no arithmetic touches them. `alpha == 255` pixels
+are copied from the replacement. Only the soft edge (1.5–2.35 % of each frame
+on the real matte) is computed, with integer arithmetic:
+`(alpha * rep + (255 - alpha) * src + 127) // 255`.
+
+That guarantee is **pre-encode**, and only pre-encode: it describes the RGB24
+frames handed to the encoder, not the `.mp4`. The pipeline is
+`RGB24 → libx264 → yuv420p`, and the RGB→YUV 4:2:0 conversion runs *before*
+x264 — it rounds through a colour-space matrix and discards three quarters of
+the chroma resolution, which decoding back to RGB cannot undo. Decoded
+background pixels of the output are therefore **not** guaranteed to match the
+source byte-for-byte at any CRF. `crf=0` is lossless only with respect to the
+yuv420p frames x264 was handed, which are already not the composited RGB.
+Verify the invariant on the composited frames, not on the encoded file.
+
+One trap worth knowing: FFmpeg's native `vp9` decoder silently drops alpha —
+`ffprobe` reports `yuv420p` for `out/o1_matte.webm` despite `ALPHA_MODE=1`.
+Only `-c:v libvpx-vp9` yields `yuva420p`. The compositor forces that decoder
+and refuses to run if the matte decodes without an alpha channel.
+
 ## Layout
 
 ```
@@ -94,6 +126,7 @@ src/video_character_skill/
   providers/fal_kling_o1.py  # Kling O1 video-to-video edit
   providers/fal_sam3.py      # SAM 3 per-object video segmentation (superseded)
   providers/fal_veed_matting.py  # VEED background removal -> alpha matte
+  compositor.py              # alpha-composite the replacement onto the original
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```
