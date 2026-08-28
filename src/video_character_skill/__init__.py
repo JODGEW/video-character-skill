@@ -3,8 +3,11 @@
 from video_character_skill.compositor import (
     CompositeError,
     CompositeReport,
+    UnionCompositeReport,
     composite_frame,
     composite_video,
+    composite_video_union,
+    union_alpha,
 )
 from video_character_skill.masks import (
     MaskDecodeError,
@@ -52,14 +55,17 @@ __all__ = [
     "SegmentationRequest",
     "SourceVideo",
     "TransferRequest",
+    "UnionCompositeReport",
     "VideoEditRequest",
     "VideoMaskTrack",
     "composite_frame",
     "composite_video",
+    "composite_video_union",
     "decode_object_mask",
     "decode_rle",
     "mask_area_ratio",
     "mask_bbox",
+    "union_alpha",
 ]
 
 __version__ = "0.0.1"

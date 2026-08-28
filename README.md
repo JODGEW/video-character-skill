@@ -114,6 +114,53 @@ One trap worth knowing: FFmpeg's native `vp9` decoder silently drops alpha —
 Only `-c:v libvpx-vp9` yields `yuva420p`. The compositor forces that decoder
 and refuses to run if the matte decodes without an alpha channel.
 
+### Dual-matte union (v2 POC)
+
+`composite_video` keys every pixel off the replacement matte alone, so the
+original person leaks through wherever the old silhouette extends past the new
+one. A read-only overlap analysis of `out/source_matte.webm` against
+`out/o1_matte.webm` (foreground = alpha ≥ 128, 225 frames) measured that
+`source_only` region at a mean 0.372 % of the frame (max 0.954 %, frame 41),
+`replacement_only` at 1.401 %, and foreground IoU at 97.02 %. Inside
+`source_only` the source alpha averages 219/255 and the replacement alpha
+17/255 — solid old-person interior, not edge noise.
+
+`compositor.composite_video_union` composites under the pixel-wise maximum of
+the two mattes:
+
+```
+effective_alpha = max(source_alpha, replacement_alpha)
+output          = composite_frame(source, replacement, effective_alpha)
+```
+
+Wherever either matte sees a person, the replacement wins. The cost is
+explicit: `source_only` pixels are now drawn from the O1 clip, so O1's
+regenerated background can show there instead of the old person. This is a
+cheap POC to judge whether that region is small enough to live with, not the
+final architecture — background recovery/inpainting is the fallback if it is
+not. The mattes are used exactly as decoded (no threshold, dilation, feather
+or inpainting) and `composite_frame` is reused unchanged, so the `alpha == 0` /
+`alpha == 255` byte-copy guarantee holds for the effective alpha. All four
+streams are validated up front (one size, one frame count, clips at one fps,
+both mattes decoded with alpha through `libvpx-vp9`) and streamed frame by
+frame. The report's `union_lift_ratio` is the mean fraction of pixels per frame
+the union actually re-routed to the replacement.
+
+To produce the v2 composite locally:
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from video_character_skill import composite_video_union
+print(composite_video_union(
+    Path('out/source_aligned_24fps.mp4'),
+    Path('out/o1_strict_prompt.mp4'),
+    Path('out/source_matte.webm'),
+    Path('out/o1_matte.webm'),
+    Path('out/composite_v2_union.mp4'),
+))"
+```
+
 ## Layout
 
 ```
@@ -126,7 +173,8 @@ src/video_character_skill/
   providers/fal_kling_o1.py  # Kling O1 video-to-video edit
   providers/fal_sam3.py      # SAM 3 per-object video segmentation (superseded)
   providers/fal_veed_matting.py  # VEED background removal -> alpha matte
-  compositor.py              # alpha-composite the replacement onto the original
+  compositor.py              # alpha-composite the replacement onto the original;
+                             # v1 single matte, v2 union of source + replacement mattes
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```

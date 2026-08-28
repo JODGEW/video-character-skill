@@ -57,13 +57,41 @@ matte decoded the wrong way would come back fully opaque and the compositor
 would emit the replacement clip unchanged — a silent, total loss of the
 background. :data:`ALPHA_DECODERS` forces the right decoder, and validation
 fails closed if the decoded pixel format has no alpha channel.
+
+Dual-matte union (v2 POC)
+-------------------------
+The single-matte path keys every pixel off the *replacement* matte. That leaks
+the original person wherever the old silhouette pokes out from under the new
+one. A read-only overlap analysis of the real mattes (foreground =
+``alpha >= 128``, 225 frames) measured that ``source_only`` region — source
+foreground, replacement background — at a mean 0.372 % of the frame, peaking
+at 0.954 %, with a mean source alpha of 219/255 and replacement alpha of
+17/255 inside it: solid old-person interior, not edge noise. Foreground IoU
+between the two mattes is 97.02 %.
+
+:func:`composite_video_union` composites under the pixel-wise maximum of the
+two mattes instead::
+
+    effective_alpha = max(source_alpha, replacement_alpha)
+    output = composite_frame(source_rgb, replacement_rgb, effective_alpha)
+
+Wherever *either* matte sees a person, the replacement clip wins. The trade is
+explicit: ``source_only`` pixels are now drawn from the O1 clip, so O1's
+regenerated background can show through there instead of the old person. This
+is a cheap POC to judge whether that region is small enough to live with, not
+the final architecture; background recovery is the fallback if it is not. The
+mattes are used exactly as decoded — no thresholding, dilation, feathering or
+inpainting — and :func:`composite_frame` is reused unchanged, so the
+``alpha == 0`` / ``alpha == 255`` byte-copy guarantee above holds for the
+*effective* alpha.
 """
 
 from __future__ import annotations
 
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -77,12 +105,17 @@ __all__ = [
     "ALPHA_PIX_FMTS",
     "CompositeError",
     "CompositeReport",
+    "UnionCompositeReport",
+    "UnionStreamStats",
     "VideoInfo",
     "composite_frame",
     "composite_streams",
+    "composite_streams_union",
     "composite_video",
+    "composite_video_union",
     "probe_video",
     "soft_edge_ratio",
+    "union_alpha",
 ]
 
 RgbFrame = NDArray[np.uint8]
@@ -154,6 +187,35 @@ class CompositeReport:
     """Mean fraction of pixels per frame that were blended rather than copied."""
 
 
+@dataclass(frozen=True)
+class UnionStreamStats:
+    """Per-clip means gathered while streaming a dual-matte composite."""
+
+    soft_edge_ratio: float
+    """Mean fraction of pixels per frame blended under the *effective* alpha."""
+    union_lift_ratio: float
+    """Mean fraction of pixels per frame where the source matte's alpha exceeded
+    the replacement matte's — where the union changed what the single-matte
+    path would have done. Those pixels now come from the replacement clip; on
+    the real mattes this is the ``source_only`` region plus part of the soft
+    edge."""
+
+
+@dataclass(frozen=True)
+class UnionCompositeReport:
+    """What one dual-matte composite run produced."""
+
+    output_path: Path
+    frames: int
+    width: int
+    height: int
+    frame_rate: Fraction
+    soft_edge_ratio: float
+    """See :attr:`UnionStreamStats.soft_edge_ratio`."""
+    union_lift_ratio: float
+    """See :attr:`UnionStreamStats.union_lift_ratio`."""
+
+
 # -- the pure part -------------------------------------------------------
 
 
@@ -213,6 +275,46 @@ def soft_edge_ratio(alpha: AlphaPlane) -> float:
     return float(np.count_nonzero((alpha != 0) & (alpha != 255))) / float(alpha.size)
 
 
+def union_alpha(source_alpha: AlphaPlane, replacement_alpha: AlphaPlane) -> AlphaPlane:
+    """Pixel-wise maximum of two mattes. Pure: no I/O, no globals.
+
+    Args:
+        source_alpha: ``(H, W)`` uint8 matte of the person in the *source* clip.
+        replacement_alpha: ``(H, W)`` uint8 matte of the person in the
+            *replacement* clip.
+
+    Returns:
+        A new ``(H, W)`` uint8 plane, exactly
+        ``np.maximum(source_alpha, replacement_alpha)``.
+
+    Raises:
+        CompositeError: on mismatched shapes, a non-2-D plane, or a non-uint8
+            input.
+
+    Neither input is thresholded, dilated, feathered or otherwise touched: a
+    pixel's effective alpha is whichever matte is more confident that there is
+    a person there. ``max(0, 0) == 0`` keeps the background copied from the
+    source; ``max(255, x) == 255`` copies the replacement wherever *either*
+    matte is fully opaque.
+    """
+    _check_alphas(source_alpha, replacement_alpha)
+    out: AlphaPlane = np.maximum(source_alpha, replacement_alpha)
+    return out
+
+
+def _check_alphas(source_alpha: AlphaPlane, replacement_alpha: AlphaPlane) -> None:
+    if source_alpha.ndim != 2:
+        raise CompositeError(f"source alpha must be (H, W), got {source_alpha.shape}")
+    if replacement_alpha.shape != source_alpha.shape:
+        raise CompositeError(
+            f"replacement alpha shape {replacement_alpha.shape} != "
+            f"source alpha shape {source_alpha.shape}"
+        )
+    for name, array in (("source", source_alpha), ("replacement", replacement_alpha)):
+        if array.dtype != np.uint8:
+            raise CompositeError(f"{name} alpha must be uint8, got {array.dtype}")
+
+
 def _check_frames(
     source: RgbFrame, replacement: RgbFrame, alpha: AlphaPlane
 ) -> None:
@@ -256,31 +358,105 @@ def composite_streams(
         CompositeError: if any stream ends before ``frames`` frames, or if any
             still has data afterwards.
     """
-    rgb_size = width * height * 3
-    rgba_size = width * height * 4
     soft_total = 0.0
 
     for index in range(frames):
-        raw_source = _read_exact(source, rgb_size, "source", index)
-        raw_replacement = _read_exact(replacement, rgb_size, "replacement", index)
-        raw_matte = _read_exact(matte, rgba_size, "matte", index)
-
-        source_frame = np.frombuffer(raw_source, np.uint8).reshape(height, width, 3)
-        replacement_frame = np.frombuffer(raw_replacement, np.uint8).reshape(
-            height, width, 3
-        )
-        alpha = np.frombuffer(raw_matte, np.uint8).reshape(height, width, 4)[:, :, 3]
+        source_frame = _read_rgb_frame(source, "source", index, width, height)
+        replacement_frame = _read_rgb_frame(replacement, "replacement", index, width, height)
+        alpha = _read_alpha_frame(matte, "matte", index, width, height)
 
         soft_total += soft_edge_ratio(alpha)
         output.write(composite_frame(source_frame, replacement_frame, alpha).tobytes())
 
-    for name, stream in (("source", source), ("replacement", replacement), ("matte", matte)):
-        if stream.read(1):
-            raise CompositeError(
-                f"{name} has more than the expected {frames} frames"
-            )
+    _assert_drained({"source": source, "replacement": replacement, "matte": matte}, frames)
 
     return soft_total / frames if frames else 0.0
+
+
+def composite_streams_union(
+    source: IO[bytes],
+    replacement: IO[bytes],
+    source_matte: IO[bytes],
+    replacement_matte: IO[bytes],
+    output: IO[bytes],
+    *,
+    width: int,
+    height: int,
+    frames: int,
+) -> UnionStreamStats:
+    """Composite ``frames`` frames under the union of two mattes, one at a time.
+
+    Reads RGB24 from ``source`` and ``replacement`` and RGBA from both mattes,
+    writes RGB24 to ``output``. Per frame::
+
+        effective_alpha = union_alpha(source_alpha, replacement_alpha)
+        output_frame = composite_frame(source_rgb, replacement_rgb, effective_alpha)
+
+    Only four input frames and one output frame are ever in memory.
+
+    Returns:
+        :class:`UnionStreamStats` with the clip's mean ratios.
+
+    Raises:
+        CompositeError: if any of the four streams ends before ``frames``
+            frames, or if any still has data afterwards.
+    """
+    soft_total = 0.0
+    lift_total = 0.0
+
+    for index in range(frames):
+        source_frame = _read_rgb_frame(source, "source", index, width, height)
+        replacement_frame = _read_rgb_frame(replacement, "replacement", index, width, height)
+        source_alpha = _read_alpha_frame(source_matte, "source_matte", index, width, height)
+        replacement_alpha = _read_alpha_frame(
+            replacement_matte, "replacement_matte", index, width, height
+        )
+
+        alpha = union_alpha(source_alpha, replacement_alpha)
+        soft_total += soft_edge_ratio(alpha)
+        lifted = np.count_nonzero(source_alpha > replacement_alpha)
+        lift_total += float(lifted) / float(alpha.size)
+        output.write(composite_frame(source_frame, replacement_frame, alpha).tobytes())
+
+    _assert_drained(
+        {
+            "source": source,
+            "replacement": replacement,
+            "source_matte": source_matte,
+            "replacement_matte": replacement_matte,
+        },
+        frames,
+    )
+
+    if not frames:
+        return UnionStreamStats(soft_edge_ratio=0.0, union_lift_ratio=0.0)
+    return UnionStreamStats(
+        soft_edge_ratio=soft_total / frames, union_lift_ratio=lift_total / frames
+    )
+
+
+def _read_rgb_frame(
+    stream: IO[bytes], name: str, index: int, width: int, height: int
+) -> RgbFrame:
+    raw = _read_exact(stream, width * height * 3, name, index)
+    frame: RgbFrame = np.frombuffer(raw, np.uint8).reshape(height, width, 3)
+    return frame
+
+
+def _read_alpha_frame(
+    stream: IO[bytes], name: str, index: int, width: int, height: int
+) -> AlphaPlane:
+    """Read one RGBA frame and keep only its alpha plane."""
+    raw = _read_exact(stream, width * height * 4, name, index)
+    alpha: AlphaPlane = np.frombuffer(raw, np.uint8).reshape(height, width, 4)[:, :, 3]
+    return alpha
+
+
+def _assert_drained(streams: Mapping[str, IO[bytes]], frames: int) -> None:
+    """Every input must be exhausted once ``frames`` frames have been read."""
+    for name, stream in streams.items():
+        if stream.read(1):
+            raise CompositeError(f"{name} has more than the expected {frames} frames")
 
 
 def _read_exact(stream: IO[bytes], size: int, name: str, index: int) -> bytes:
@@ -385,6 +561,27 @@ def _validate(source: VideoInfo, replacement: VideoInfo, matte: VideoInfo) -> No
         )
 
 
+def _validate_union(
+    source: VideoInfo,
+    replacement: VideoInfo,
+    source_matte: VideoInfo,
+    replacement_matte: VideoInfo,
+) -> None:
+    """Fail closed unless all four streams agree and both mattes carry alpha.
+
+    Each matte is held to exactly the single-matte rules against the same
+    source/replacement pair, so every stream must share one size and one frame
+    count, the two clips one frame rate, and each matte must have decoded with
+    an alpha channel. The offending matte is named in the error.
+    """
+    mattes = (("source matte", source_matte), ("replacement matte", replacement_matte))
+    for name, matte in mattes:
+        try:
+            _validate(source, replacement, matte)
+        except CompositeError as exc:
+            raise CompositeError(f"{name}: {exc}") from exc
+
+
 # -- orchestration -------------------------------------------------------
 
 
@@ -425,35 +622,22 @@ def composite_video(
     matte = _probe_matte(matte_path)
     _validate(source, replacement, matte)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    logs = {name: tempfile.TemporaryFile() for name in ("source", "replacement", "matte", "encode")}
-    processes: dict[str, subprocess.Popen[bytes]] = {}
-    try:
-        processes["source"] = _decoder(source_path, "rgb24", None, logs["source"])
-        processes["replacement"] = _decoder(replacement_path, "rgb24", None, logs["replacement"])
-        processes["matte"] = _decoder(
-            matte_path, "rgba", ALPHA_DECODERS.get(matte.codec_name), logs["matte"]
-        )
-        processes["encode"] = _encoder(
-            output_path, source, crf=crf, preset=preset, log=logs["encode"]
-        )
-
+    decodes = {
+        "source": _Decode(source_path, "rgb24", None),
+        "replacement": _Decode(replacement_path, "rgb24", None),
+        "matte": _Decode(matte_path, "rgba", ALPHA_DECODERS.get(matte.codec_name)),
+    }
+    pipeline = _ffmpeg_pipeline(decodes, output_path, source, crf=crf, preset=preset)
+    with pipeline as (pipes, encode):
         ratio = composite_streams(
-            _pipe(processes["source"].stdout, "source"),
-            _pipe(processes["replacement"].stdout, "replacement"),
-            _pipe(processes["matte"].stdout, "matte"),
-            _pipe(processes["encode"].stdin, "encode"),
+            pipes["source"],
+            pipes["replacement"],
+            pipes["matte"],
+            encode,
             width=source.width,
             height=source.height,
             frames=source.frame_count,
         )
-        _finish(processes, logs)
-    finally:
-        for process in processes.values():
-            if process.poll() is None:
-                process.kill()
-        for log in logs.values():
-            log.close()
 
     return CompositeReport(
         output_path=output_path,
@@ -463,6 +647,129 @@ def composite_video(
         frame_rate=source.frame_rate,
         soft_edge_ratio=ratio,
     )
+
+
+def composite_video_union(
+    source_path: Path,
+    replacement_path: Path,
+    source_matte_path: Path,
+    replacement_matte_path: Path,
+    output_path: Path,
+    *,
+    crf: int = 16,
+    preset: str = "slow",
+) -> UnionCompositeReport:
+    """Composite four clips into one H.264 MP4 under the union of two mattes.
+
+    Args:
+        source_path: the original footage.
+        replacement_path: the edited footage (Kling O1).
+        source_matte_path: matte of the person in the *source* clip; its
+            alpha channel is one input to the union.
+        replacement_matte_path: matte of the person in the *replacement* clip;
+            the other input to the union.
+        output_path: the ``.mp4`` to write.
+        crf: x264 quality, as for :func:`composite_video`.
+        preset: x264 speed/efficiency preset.
+
+    Returns:
+        A :class:`UnionCompositeReport` describing what was written.
+
+    Raises:
+        CompositeError: if any of the four streams differs in size or frame
+            count, the two clips differ in frame rate, either matte decodes
+            without alpha, any stream ends early or late, or any ffmpeg
+            process fails.
+
+    Per frame ``effective_alpha = max(source_alpha, replacement_alpha)`` and
+    the frame goes through :func:`composite_frame` unchanged, so
+    ``effective_alpha == 0`` pixels are the source's exact bytes and
+    ``effective_alpha == 255`` pixels the replacement's, pre-encode. See the
+    module docstring for what the union trades away.
+    """
+    source = probe_video(source_path)
+    replacement = probe_video(replacement_path)
+    source_matte = _probe_matte(source_matte_path)
+    replacement_matte = _probe_matte(replacement_matte_path)
+    _validate_union(source, replacement, source_matte, replacement_matte)
+
+    decodes = {
+        "source": _Decode(source_path, "rgb24", None),
+        "replacement": _Decode(replacement_path, "rgb24", None),
+        "source_matte": _Decode(
+            source_matte_path, "rgba", ALPHA_DECODERS.get(source_matte.codec_name)
+        ),
+        "replacement_matte": _Decode(
+            replacement_matte_path, "rgba", ALPHA_DECODERS.get(replacement_matte.codec_name)
+        ),
+    }
+    pipeline = _ffmpeg_pipeline(decodes, output_path, source, crf=crf, preset=preset)
+    with pipeline as (pipes, encode):
+        stats = composite_streams_union(
+            pipes["source"],
+            pipes["replacement"],
+            pipes["source_matte"],
+            pipes["replacement_matte"],
+            encode,
+            width=source.width,
+            height=source.height,
+            frames=source.frame_count,
+        )
+
+    return UnionCompositeReport(
+        output_path=output_path,
+        frames=source.frame_count,
+        width=source.width,
+        height=source.height,
+        frame_rate=source.frame_rate,
+        soft_edge_ratio=stats.soft_edge_ratio,
+        union_lift_ratio=stats.union_lift_ratio,
+    )
+
+
+@dataclass(frozen=True)
+class _Decode:
+    """One ffmpeg decode to spawn: which file, to which raw format, under which decoder."""
+
+    path: Path
+    pix_fmt: str
+    decoder: str | None
+
+
+@contextmanager
+def _ffmpeg_pipeline(
+    decodes: Mapping[str, _Decode],
+    output_path: Path,
+    encode_as: VideoInfo,
+    *,
+    crf: int,
+    preset: str,
+) -> Iterator[tuple[Mapping[str, IO[bytes]], IO[bytes]]]:
+    """Spawn one decoder per input plus the encoder; hand back their pipes.
+
+    Yields ``(decoder stdouts by name, encoder stdin)``. On a clean exit from
+    the block the encoder's input is closed and every process must exit 0,
+    otherwise :class:`CompositeError` carries its stderr. If the block raises,
+    every still-running process is killed and the exception propagates.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    logs = {name: tempfile.TemporaryFile() for name in (*decodes, "encode")}
+    processes: dict[str, subprocess.Popen[bytes]] = {}
+    try:
+        for name, decode in decodes.items():
+            processes[name] = _decoder(decode.path, decode.pix_fmt, decode.decoder, logs[name])
+        processes["encode"] = _encoder(
+            output_path, encode_as, crf=crf, preset=preset, log=logs["encode"]
+        )
+        pipes = {name: _pipe(processes[name].stdout, name) for name in decodes}
+        yield pipes, _pipe(processes["encode"].stdin, "encode")
+        _finish(processes, logs)
+    finally:
+        for process in processes.values():
+            if process.poll() is None:
+                process.kill()
+        for log in logs.values():
+            log.close()
 
 
 def _decoder(
