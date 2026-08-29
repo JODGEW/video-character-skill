@@ -521,20 +521,50 @@ residual, the accepted `S_inside`, the tier-2 filled and unresolved shares,
 the residual component count, the components without a tier-2 seed and the
 tier-2 propagation depth p50/p90/max.
 
+The accepted configuration is pinned in `pipeline.composite_video_v11`, the
+public entry point for this composite: removal 32/4, `background_threshold=1`,
+`residual_threshold=32`, replacement foreground 128, temporal radius 24, at
+most 5 observations, rim window 32 at strength 0.5 — none of them is a
+parameter. (`composite_video_rim_corrected`'s own defaults are v9; v11 needs
+those two thresholds passed explicitly, which the wrapper does.)
+
 ```bash
 .venv/bin/python -c "
 from pathlib import Path
-from video_character_skill import composite_video_rim_corrected
-print(composite_video_rim_corrected(
+from video_character_skill import composite_video_v11
+print(composite_video_v11(
     Path('out/source_aligned_24fps.mp4'),
     Path('out/o1_strict_prompt.mp4'),
     Path('out/source_matte.webm'),
     Path('out/o1_matte.webm'),
     Path('out/composite_v11_tier2.mp4'),
-    background_threshold=1,
-    residual_threshold=32,
+    audio_source_path=None,
 ))"
 ```
+
+`audio_source_path` is keyword-only and required, because the encoder itself
+writes video only (`-an`):
+
+- a `Path` muxes that file's **first audio stream** onto the rendered frames
+  (`-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -af apad -shortest`). The file
+  must already be time-aligned to the source video — the wrapper does not
+  retime, trim, offset or check duration. The output always keeps the full
+  video duration: audio shorter than the video is padded with silence, audio
+  longer than the video is cut at the video's end, and the video stream
+  itself is never shortened by the audio's duration.
+  `out/source_aligned_24fps.mp4` carries no audio (the retime stripped it),
+  which is why the command above passes `None`;
+- `None` produces an intentionally silent output;
+- a path that is missing or has no audio stream is an error *before* the
+  composite starts. There is no fallback from a requested source to silence.
+
+Everything is rendered to unique `.part.mp4` temporaries in the output
+directory and published with one `os.replace`, so an existing output stays
+byte-identical unless the whole run — composite and mux — succeeded. The
+report wraps the engine's `RimCorrectedCompositeReport` and records whether
+audio was requested and muxed. The wrapper does not poll or download provider
+jobs, does not align or retime the four inputs, and makes no paid call: the
+inputs must already exist locally and agree in size, frame count and rate.
 
 **Known limitation.** Source-matte pixels with alpha 1–31 that lie outside
 the 32/4 removal mask are composited as they are, so low-alpha source content
@@ -571,19 +601,30 @@ src/video_character_skill/
                              # rebuilt as real background (diagnostic)
   rim_correction.py          # v9: local box-window rim-tone correction of O1's edge RGB,
                              # applied through the v6/v7 replacement_filter hook
+  pipeline.py                # composite_video_v11: the accepted v11 configuration pinned,
+                             # explicit audio mux, atomic publication of the output
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```
 
 Media is referenced by URI only (an `http(s)` URL or a local path). Local paths
 are uploaded through `fal_client.upload_file` at submit time; remote URLs are
-passed through untouched. Nothing here decodes or re-encodes video — no FFmpeg,
-no storage layer of our own.
+passed through untouched. The providers never decode video. The compositing
+modules do: they probe every input with `ffprobe` and stream raw frames
+through `ffmpeg` subprocesses (one decoder per input, one `libx264` encoder,
+plus the audio mux in `pipeline.py`), so **`ffmpeg` and `ffprobe` are
+required system dependencies** for anything past the provider calls. There
+is no storage layer of our own.
 
 Masks are the one thing that becomes an array: `masks.py` turns an `ObjectMask`
 into a NumPy boolean mask for the compositing step to come.
 
 ## Local setup
+
+`ffmpeg` and `ffprobe` (FFmpeg, with the `libvpx-vp9` decoder for the VEED
+mattes) must be on `PATH`; `composite_video_v11` refuses to start without
+them. Install them with your package manager, e.g. `brew install ffmpeg` or
+`apt install ffmpeg`.
 
 ```bash
 python3 -m venv .venv

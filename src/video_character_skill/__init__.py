@@ -33,6 +33,7 @@ from video_character_skill.masks import (
     mask_area_ratio,
     mask_bbox,
 )
+from video_character_skill.pipeline import V11CompositeReport, composite_video_v11
 from video_character_skill.rim_correction import (
     RIM_STRENGTH,
     RIM_WINDOW,
@@ -111,6 +112,7 @@ __all__ = [
     "SourceVideo",
     "TransferRequest",
     "UnionCompositeReport",
+    "V11CompositeReport",
     "VideoEditRequest",
     "VideoMaskTrack",
     "composite_frame",
@@ -122,6 +124,7 @@ __all__ = [
     "composite_video_spatial_recovery",
     "composite_video_temporal_recovery",
     "composite_video_union",
+    "composite_video_v11",
     "decode_object_mask",
     "decode_rle",
     "hardened_union_alpha",
