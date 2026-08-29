@@ -445,6 +445,108 @@ print(composite_video_hard_inset_recovery(
 ))"
 ```
 
+### Local rim-tone correction (v9 POC)
+
+v8 (a hard, 2-px-inset binary foreground) removed no contour and added ~20x
+more static-pixel edge flicker, so v9 returns to the v7 compositing path
+unchanged (soft replacement alpha, `force_replacement` at 128, source removal
+32/4, temporal + spatial recovery) and changes only the *replacement RGB*
+before it is composited. Attribution had excluded every compositing-side
+cause; what remains is a rim rendered into O1's own RGB inside
+`replacement_alpha >= 250` (head region: +15 luma at the outermost ring,
+decaying over ~6 px). Because the silhouette is three very different
+materials in equal thirds, a global per-ring offset over-corrects the dark
+ones and misses the bright ones; the read-only feasibility study picked a
+local box-window offset at half strength (`rim_correction.py`; v1–v8
+untouched, the v6 streaming loop gained an optional `replacement_filter`
+hook that defaults to `None`):
+
+```
+core      = replacement_alpha >= 250
+band_k    = erode_disk(core, lo) & ~erode_disk(core, hi)      (0,1) (1,2) (2,3) (3,4) (4,6)
+reference = erode_disk(core, 8) & ~erode_disk(core, 12)
+per band, per channel, at each band pixel (32x32 box, clipped at the frame; integral images):
+    offset = mean(reference rgb in box) - mean(band rgb in box)
+    valid  = >= 8 band px and >= 16 reference px in the box
+    rgb    = clip(rint(rgb + 0.5 * offset), 0, 255)          only where band & valid
+```
+
+Nothing else changes: alpha, masks and recovery are v7's. The report adds
+the rim's target/corrected share of the frame, the valid share, the mean and
+maximum applied offset and the clipping share.
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from video_character_skill import composite_video_rim_corrected
+print(composite_video_rim_corrected(
+    Path('out/source_aligned_24fps.mp4'),
+    Path('out/o1_strict_prompt.mp4'),
+    Path('out/source_matte.webm'),
+    Path('out/o1_matte.webm'),
+    Path('out/composite_v9_local32_s05.mp4'),
+))"
+```
+
+### Two-tier residual recovery (v11 POC)
+
+v10 (the v9 code run with `background_threshold=1`: only `source_alpha == 0`
+is own-frame background, a temporal donor or a first-pass spatial seed)
+removed the old person's hair/skin ghosts, but the enclosed regions the
+replacement matte carves out — the hoop earring's interior in frames
+~206–220 — then had no trusted donor or seed at all, fell back to O1's light
+regenerated background and flashed. A read-only measurement showed that every
+such component holds, or borders, source pixels with alpha 1–31 whose colour
+matches the surroundings. v11 keeps tier 1 exactly as v10 and adds an
+optional lower-confidence pass over the tier-1 residual only, before the O1
+fallback (`spatial_recovery.recover_residual`, threaded through the v6 loop
+and the v9 orchestrator as `residual_threshold`; `None`, the default, keeps
+every earlier version byte for byte):
+
+```
+residual_1 = temporal_unrecovered & ~filled          # tier 1 as before: whole seedless components
+low        = background_threshold <= source_alpha_i < residual_threshold      (v11: 1 <= a < 32)
+S_inside   = residual_1 & low       # own-frame soft pixels: their source RGB is copied in
+T          = residual_1 & ~low      # old-person pixels: filled by the same synchronous waves
+seeds      = trusted | filled | low # tier-1 resolved, S_inside, the low ring outside residual_1
+residual_2 = T & ~filled_2          # only this falls back to O1
+```
+
+Temporal donor eligibility is not relaxed; tier-1 own, temporal and spatial
+pixels are never rewritten; nothing outside `residual_1` changes; a residual
+component no seed touches stays O1; a threshold not above
+`background_threshold` is an exact no-op. `spatial_unrecovered_ratio` and the
+O1-fallback share now describe `residual_2`, and the report adds the tier-1
+residual, the accepted `S_inside`, the tier-2 filled and unresolved shares,
+the residual component count, the components without a tier-2 seed and the
+tier-2 propagation depth p50/p90/max.
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from video_character_skill import composite_video_rim_corrected
+print(composite_video_rim_corrected(
+    Path('out/source_aligned_24fps.mp4'),
+    Path('out/o1_strict_prompt.mp4'),
+    Path('out/source_matte.webm'),
+    Path('out/o1_matte.webm'),
+    Path('out/composite_v11_tier2.mp4'),
+    background_threshold=1,
+    residual_threshold=32,
+))"
+```
+
+**Known limitation.** Source-matte pixels with alpha 1–31 that lie outside
+the 32/4 removal mask are composited as they are, so low-alpha source content
+the matte rates as background can survive — the see-through interior of the
+source person's glasses lens shows as a bright sliver beside the replacement
+cheek in frames ~34–49. Closing the source core globally before the dilation
+(a padded radius-12 closing) removed it but was rejected: its additions along
+the whole silhouette caused foreground/background edge adhesion at the
+replacement's soft edge, and neither a replacement-alpha gate nor a
+geometry-only pocket rule cleared that without side effects. v11 remains the
+accepted POC base.
+
 ## Layout
 
 ```
@@ -463,9 +565,12 @@ src/video_character_skill/
   temporal_recovery.py       # v5: real background borrowed from nearby source frames
                              # inside the v4 mask, with additive photometric correction
   spatial_recovery.py        # v6: v5's unrecovered pixels filled by synchronous-wave
-                             # propagation from trusted real background, O1 last
+                             # propagation from trusted real background, O1 last;
+                             # v11: optional tier-2 pass over the residual (residual_threshold)
   hard_inset_recovery.py     # v8: eroded opaque replacement core only, dropped edge
                              # rebuilt as real background (diagnostic)
+  rim_correction.py          # v9: local box-window rim-tone correction of O1's edge RGB,
+                             # applied through the v6/v7 replacement_filter hook
   masks.py                   # decode SAM 3 RLE into (height, width) bool arrays
 tests/                       # schemas, provider contract, fal payload/mapping, RLE decoding
 ```

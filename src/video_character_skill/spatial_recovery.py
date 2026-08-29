@@ -44,10 +44,33 @@ therefore: own-frame real background, temporally borrowed real background,
 spatially propagated real background, and only then O1. The old person is
 never a fallback. No optical flow, registration, gain fitting, feathering,
 external inpainting or new dependency.
+
+Tier-2 residual recovery (v11)
+------------------------------
+With ``residual_threshold`` above ``background_threshold`` (v11: 1 and 32),
+the tier-1 residual — the components the fill above left for O1 — gets one
+more, lower-confidence pass before the O1 fallback. Nothing above changes::
+
+    residual_1 = temporal_unrecovered & ~filled         # whole seedless components
+    low        = background_threshold <= source_alpha_i < residual_threshold
+    S_inside   = residual_1 & low       # own-frame soft pixels: source RGB copied in
+    T          = residual_1 & ~low      # old-person pixels: filled by the same waves
+    seeds      = trusted | filled | low # tier-1 resolved, S_inside and the low ring
+                                        # outside residual_1 (source RGB)
+    fill T from seeds exactly as above
+    residual_2 = T & ~filled_2          # only this falls back to O1
+
+Tier-1 own, temporal and spatial pixels are never rewritten; only
+``residual_1`` pixels can differ from the single-tier result. A residual
+component no seed touches is left whole to O1. ``None`` (the default) or a
+threshold not above ``background_threshold`` disables the pass and reproduces
+v6 byte for byte.
 """
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -95,6 +118,8 @@ __all__ = [
     "SPATIAL_FILL_MARGIN",
     "ComponentFill",
     "FrameBackground",
+    "ReplacementFilter",
+    "ResidualFill",
     "SpatialFill",
     "SpatialRecoveryCompositeReport",
     "SpatialRecoveryStreamStats",
@@ -102,6 +127,7 @@ __all__ = [
     "composite_video_spatial_recovery",
     "label_components",
     "recover_frame_background",
+    "recover_residual",
     "spatial_fill_component",
     "spatial_fill_components",
     "temporal_plate",
@@ -111,6 +137,14 @@ __all__ = [
 # Pixels of context kept around a component's bounding box: one ring, which
 # is exactly the reach of an 8-neighbourhood.
 SPATIAL_FILL_MARGIN = 1
+
+ReplacementFilter = Callable[[RgbFrame, AlphaPlane], RgbFrame]
+"""Optional per-frame hook: ``(replacement_rgb, replacement_alpha) -> replacement_rgb``.
+
+Applied to the decoded replacement frame before anything else sees it. It
+may only return a new RGB frame; the alpha plane, every mask and the
+compositing path are untouched. ``None`` means v6 behaviour, byte for byte.
+"""
 
 # The eight (dy, dx) neighbour offsets, in a fixed order (the order is
 # irrelevant to the result: each wave only sums over them).
@@ -153,6 +187,26 @@ class SpatialFill:
 
 
 @dataclass(frozen=True)
+class ResidualFill:
+    """What the tier-2 pass produced for one frame's tier-1 residual."""
+
+    rgb: RgbFrame
+    """The tier-1 plate with ``accepted`` and ``filled`` written; all else unchanged."""
+    accepted: BoolMask
+    """``S_inside``: residual pixels in the low band, holding their own source RGB."""
+    filled: BoolMask
+    """``T`` pixels the waves resolved."""
+    residual: BoolMask
+    """``residual_2``: ``T`` pixels no wave reached — the only O1 fallback left."""
+    depth: NDArray[np.int32]
+    """Wave index (1-based) at which each filled pixel resolved; 0 elsewhere."""
+    components: int
+    """8-connected components of the tier-1 residual."""
+    components_without_seed: int
+    """Of those, the ones no seed touched: left whole to O1."""
+
+
+@dataclass(frozen=True)
 class FrameBackground:
     """The v6 background plate for one frame and how it was assembled."""
 
@@ -162,8 +216,12 @@ class FrameBackground:
     temporal_unrecovered: BoolMask
     """Pixels v5 could not recover: the spatial target."""
     fill: SpatialFill
+    tier1_residual: BoolMask
+    """``temporal_unrecovered`` pixels the tier-1 fill could not reach."""
+    tier2: ResidualFill | None
+    """The tier-2 pass over ``tier1_residual``; ``None`` when it is disabled."""
     residual: BoolMask
-    """``temporal_unrecovered`` pixels the spatial fill could not reach: O1 fallback."""
+    """Pixels that end as O1 fallback: ``tier1_residual`` with tier 2 off, else its ``residual``."""
 
 
 @dataclass(frozen=True)
@@ -176,6 +234,13 @@ class SpatialRecoveryStreamStats:
     background (frames with an empty region are skipped). The propagation
     depths are over all spatially filled pixels of the clip, in waves
     (1 = adjacent to a trusted seed); NaN / 0 when nothing was filled.
+
+    ``spatial_unrecovered_ratio`` and ``o1_fallback_ratio`` count the pixels
+    that actually end as O1 fallback: ``residual_2`` when the tier-2 pass is
+    on, the tier-1 residual otherwise. ``tier1_residual_ratio`` and the
+    ``tier2_*`` fields report that pass; its depths are ``math.nan`` (one
+    shared object, so stats stay comparable) / 0 when nothing was filled or
+    the pass is off. ``tier2_residual_ratio`` equals ``spatial_unrecovered_ratio``.
     """
 
     soft_edge_ratio: float
@@ -197,6 +262,21 @@ class SpatialRecoveryStreamStats:
     donor_fits: int
     zero_offset_fallbacks: int
     peak_cached_frames: int
+    tier1_residual_ratio: float
+    """Mean over frames of the tier-1 residual share of the full frame (before tier 2)."""
+    tier2_accepted_ratio: float
+    """Mean over frames of the ``S_inside`` share of the full frame."""
+    tier2_filled_ratio: float
+    """Mean over frames of the tier-2 filled ``T`` share of the full frame."""
+    tier2_residual_ratio: float
+    """Mean over frames of the final O1-fallback share; equals ``spatial_unrecovered_ratio``."""
+    tier2_components: int
+    """Tier-1 residual components the tier-2 pass processed."""
+    tier2_components_without_seed: int
+    """Of those, the ones no tier-2 seed touched: left whole to O1."""
+    median_tier2_depth: float
+    p90_tier2_depth: float
+    max_tier2_depth: int
 
 
 @dataclass(frozen=True)
@@ -406,6 +486,73 @@ def temporal_plate(
     return plate, recovered.reshape(source_rgb.shape[:2]), unrecovered.reshape(source_rgb.shape[:2])
 
 
+def recover_residual(
+    plate: RgbFrame,
+    source_rgb: RgbFrame,
+    source_alpha: AlphaPlane,
+    resolved: BoolMask,
+    residual: BoolMask,
+    *,
+    background_threshold: int,
+    residual_threshold: int,
+) -> ResidualFill:
+    """The tier-2 pass over the tier-1 residual. Pure.
+
+    ``plate`` is the tier-1 plate (own background, temporal recovery and the
+    tier-1 fill written in; ``residual`` pixels still hold the source frame),
+    ``resolved`` everything tier 1 resolved (trusted plus filled) and
+    ``residual`` the tier-1 residual; the two must not overlap. With
+    ``low = background_threshold <= source_alpha < residual_threshold``::
+
+        accepted = residual & low      # S_inside: its own source RGB is copied in
+        target   = residual & ~low     # T
+        seeds    = resolved | low      # S_inside, the low ring outside the residual
+                                       # and whatever tier 1 resolved
+
+    ``target`` is filled by :func:`spatial_fill_components` from ``seeds``,
+    read from the plate — which is the source frame at every low pixel that
+    tier 1 did not resolve (:func:`temporal_plate` and the tier-1 fill write
+    nothing else), so every new seed contributes source RGB. Only
+    ``accepted`` and filled pixels are written. A residual component no seed
+    touches stays unfilled: the returned ``residual`` (``residual_2``) is
+    ``target`` minus the filled pixels. With ``residual_threshold <=
+    background_threshold`` the low band is empty and nothing is accepted or
+    filled.
+    """
+    _check_rgb("plate", plate)
+    _check_rgb("source_rgb", source_rgb)
+    if source_rgb.shape != plate.shape:
+        raise CompositeError(f"source shape {source_rgb.shape} != plate shape {plate.shape}")
+    _check_alpha("source_alpha", source_alpha)
+    if source_alpha.shape != plate.shape[:2]:
+        raise CompositeError(f"source_alpha shape {source_alpha.shape} != {plate.shape[:2]}")
+    _check_mask("resolved", resolved, plate.shape[:2])
+    _check_mask("residual", residual, plate.shape[:2])
+    if bool((resolved & residual).any()):
+        raise CompositeError("resolved and residual overlap")
+    _check_int_range("background_threshold", background_threshold, 1, 255)
+    _check_int_range("residual_threshold", residual_threshold, 1, 255)
+    low: BoolMask = (source_alpha >= background_threshold) & (source_alpha < residual_threshold)
+    accepted: BoolMask = residual & low
+    target: BoolMask = residual & ~low
+    seeds: BoolMask = resolved | low
+    plate2: RgbFrame = plate.copy()
+    plate2[accepted] = source_rgb[accepted]
+    fill = spatial_fill_components(plate2, seeds, target)
+    labels, components = label_components(residual)
+    touched = np.zeros(components + 1, dtype=np.bool_)
+    touched[labels[accepted | fill.filled]] = True
+    return ResidualFill(
+        rgb=fill.rgb,
+        accepted=accepted,
+        filled=fill.filled,
+        residual=target & ~fill.filled,
+        depth=fill.depth,
+        components=components,
+        components_without_seed=components - int(np.count_nonzero(touched[1:])),
+    )
+
+
 def recover_frame_background(
     source_rgb: RgbFrame,
     replacement_rgb: RgbFrame,
@@ -413,6 +560,7 @@ def recover_frame_background(
     recovery: TemporalRecovery,
     *,
     background_threshold: int = SOURCE_BACKGROUND_THRESHOLD,
+    residual_threshold: int | None = None,
 ) -> FrameBackground:
     """The v6 background plate for one frame. Pure.
 
@@ -420,25 +568,50 @@ def recover_frame_background(
     byte; ``temporal_unrecovered`` pixels are spatially filled from trusted
     real background where a component has a trusted neighbour, and hold the
     replacement (O1) pixel otherwise. The old person never survives.
+
+    ``residual_threshold`` above ``background_threshold`` runs the tier-2
+    pass (:func:`recover_residual`) over what the fill left, so that only
+    its ``residual_2`` holds O1. ``None`` (the default) or a value not above
+    ``background_threshold`` leaves tier 2 off, and the result is v6's, byte
+    for byte.
     """
     _check_rgb("replacement_rgb", replacement_rgb)
     if replacement_rgb.shape != source_rgb.shape:
         raise CompositeError(
             f"replacement shape {replacement_rgb.shape} != source shape {source_rgb.shape}"
         )
+    if residual_threshold is not None:
+        _check_int_range("residual_threshold", residual_threshold, 1, 255)
     plate, recovered, unrecovered = temporal_plate(source_rgb, recovery)
     trusted = trusted_background(
         source_alpha, recovered, background_threshold=background_threshold
     )
     fill = spatial_fill_components(plate, trusted, unrecovered)
-    residual: BoolMask = unrecovered & ~fill.filled
-    background: RgbFrame = fill.rgb.copy()
+    tier1_residual: BoolMask = unrecovered & ~fill.filled
+    tier2: ResidualFill | None = None
+    if residual_threshold is not None and residual_threshold > background_threshold:
+        tier2 = recover_residual(
+            fill.rgb,
+            source_rgb,
+            source_alpha,
+            trusted | fill.filled,
+            tier1_residual,
+            background_threshold=background_threshold,
+            residual_threshold=residual_threshold,
+        )
+        background: RgbFrame = tier2.rgb.copy()
+        residual: BoolMask = tier2.residual
+    else:
+        background = fill.rgb.copy()
+        residual = tier1_residual
     background[residual] = replacement_rgb[residual]
     return FrameBackground(
         background=background,
         temporal_recovered=recovered,
         temporal_unrecovered=unrecovered,
         fill=fill,
+        tier1_residual=tier1_residual,
+        tier2=tier2,
         residual=residual,
     )
 
@@ -550,6 +723,15 @@ def _check_mask(name: str, mask: BoolMask, shape: tuple[int, ...] | None = None)
         raise CompositeError(f"{name} shape {mask.shape} != {tuple(shape)}")
 
 
+def _add_depths(hist: NDArray[np.int64], depths: NDArray[np.int32]) -> NDArray[np.int64]:
+    """``hist`` with a bincount of ``depths`` added, grown to fit."""
+    counts = np.bincount(depths)
+    if counts.size > hist.size:
+        hist = np.concatenate([hist, np.zeros(counts.size - hist.size, dtype=np.int64)])
+    hist[: counts.size] += counts
+    return hist
+
+
 # -- streaming -----------------------------------------------------------
 
 
@@ -572,12 +754,18 @@ def composite_streams_spatial_recovery(
     offset_stride: int = PHOTOMETRIC_SUBSAMPLE_STRIDE,
     offset_min_samples: int = PHOTOMETRIC_MIN_SAMPLES,
     offset_limit: int = PHOTOMETRIC_OFFSET_LIMIT,
+    residual_threshold: int | None = None,
+    replacement_filter: ReplacementFilter | None = None,
 ) -> SpatialRecoveryStreamStats:
     """Composite ``frames`` frames with temporal then spatial background recovery.
 
     Same streams, read-ahead window, parameters and failure modes as
     :func:`video_character_skill.temporal_recovery.composite_streams_temporal_recovery`;
-    the per-frame algorithm is the module docstring's.
+    the per-frame algorithm is the module docstring's. ``residual_threshold``
+    above ``background_threshold`` enables the tier-2 residual pass
+    (:func:`recover_residual`); ``None`` keeps v6 byte for byte.
+    ``replacement_filter``, when given, rewrites each replacement RGB frame
+    (never its alpha) before it is used — see :data:`ReplacementFilter`.
 
     Raises:
         CompositeError: on an invalid parameter (before anything is read), if
@@ -593,6 +781,8 @@ def composite_streams_spatial_recovery(
     _check_int_range("offset_stride", offset_stride, 1, None)
     _check_int_range("offset_min_samples", offset_min_samples, 1, None)
     _check_int_range("offset_limit", offset_limit, 0, 255)
+    if residual_threshold is not None:
+        _check_int_range("residual_threshold", residual_threshold, 1, 255)
 
     window = _SourceWindow(
         source, source_matte, width=width, height=height, frames=frames, radius=radius
@@ -609,6 +799,10 @@ def composite_streams_spatial_recovery(
     fallbacks = 0
     components = 0
     without_seed = 0
+    tier1_residual_total = accepted_total = filled2_total = 0.0
+    depth2_hist: NDArray[np.int64] = np.zeros(1, dtype=np.int64)
+    tier2_components = 0
+    tier2_without_seed = 0
 
     for index in range(frames):
         window.advance(index)
@@ -616,6 +810,8 @@ def composite_streams_spatial_recovery(
         replacement_alpha = _read_alpha_frame(
             replacement_matte, "replacement_matte", index, width, height
         )
+        if replacement_filter is not None:
+            replacement_frame = replacement_filter(replacement_frame, replacement_alpha)
         source_frame, source_alpha = window.frame(index)
 
         regions = recovery_regions(
@@ -647,6 +843,7 @@ def composite_streams_spatial_recovery(
             source_alpha,
             recovery,
             background_threshold=background_threshold,
+            residual_threshold=residual_threshold,
         )
         alpha = recovery_effective_alpha(replacement_alpha, regions.force_replacement)
         output.write(composite_frame(result.background, replacement_frame, alpha).tobytes())
@@ -669,12 +866,16 @@ def composite_streams_spatial_recovery(
         if recovery.distances.size:
             distance_hist += np.bincount(recovery.distances, minlength=radius + 1)[: radius + 1]
         if spatial:
-            depths = np.bincount(result.fill.depth[result.fill.filled])
-            if depths.size > depth_hist.size:
-                depth_hist = np.concatenate(
-                    [depth_hist, np.zeros(depths.size - depth_hist.size, dtype=np.int64)]
-                )
-            depth_hist[: depths.size] += depths
+            depth_hist = _add_depths(depth_hist, result.fill.depth[result.fill.filled])
+        tier1_residual_total += float(np.count_nonzero(result.tier1_residual)) / size
+        if result.tier2 is not None:
+            accepted_total += float(np.count_nonzero(result.tier2.accepted)) / size
+            filled2 = int(np.count_nonzero(result.tier2.filled))
+            filled2_total += filled2 / size
+            tier2_components += result.tier2.components
+            tier2_without_seed += result.tier2.components_without_seed
+            if filled2:
+                depth2_hist = _add_depths(depth2_hist, result.tier2.depth[result.tier2.filled])
         recovered_pixels += got
         observations_used += int(recovery.counts.sum())
         fits += recovery.donor_fits
@@ -715,6 +916,15 @@ def composite_streams_spatial_recovery(
         donor_fits=fits,
         zero_offset_fallbacks=fallbacks,
         peak_cached_frames=window.peak,
+        tier1_residual_ratio=tier1_residual_total / frames if frames else 0.0,
+        tier2_accepted_ratio=accepted_total / frames if frames else 0.0,
+        tier2_filled_ratio=filled2_total / frames if frames else 0.0,
+        tier2_residual_ratio=residual_total / frames if frames else 0.0,
+        tier2_components=tier2_components,
+        tier2_components_without_seed=tier2_without_seed,
+        median_tier2_depth=_hist_percentile(depth2_hist, 50) if depth2_hist.any() else math.nan,
+        p90_tier2_depth=_hist_percentile(depth2_hist, 90) if depth2_hist.any() else math.nan,
+        max_tier2_depth=int(np.flatnonzero(depth2_hist).max()) if depth2_hist.any() else 0,
     )
 
 

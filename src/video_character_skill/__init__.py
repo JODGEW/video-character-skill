@@ -33,6 +33,12 @@ from video_character_skill.masks import (
     mask_area_ratio,
     mask_bbox,
 )
+from video_character_skill.rim_correction import (
+    RIM_STRENGTH,
+    RIM_WINDOW,
+    RimCorrectedCompositeReport,
+    composite_video_rim_corrected,
+)
 from video_character_skill.schemas import (
     CharacterOrientation,
     DrivingVideo,
@@ -72,6 +78,8 @@ __all__ = [
     "HARD_INSET_REMOVAL_THRESHOLD",
     "MAX_TEMPORAL_OBSERVATIONS",
     "REPLACEMENT_FOREGROUND_THRESHOLD",
+    "RIM_STRENGTH",
+    "RIM_WINDOW",
     "SOURCE_BACKGROUND_THRESHOLD",
     "SOURCE_HARDEN_THRESHOLD",
     "SOURCE_REMOVAL_DILATION_RADIUS",
@@ -83,6 +91,7 @@ __all__ = [
     "CompositeReport",
     "HardInsetCompositeReport",
     "HardenedUnionCompositeReport",
+    "RimCorrectedCompositeReport",
     "SourceRemovalCompositeReport",
     "SpatialRecoveryCompositeReport",
     "TemporalRecoveryCompositeReport",
@@ -108,6 +117,7 @@ __all__ = [
     "composite_video",
     "composite_video_hard_inset_recovery",
     "composite_video_hardened_union",
+    "composite_video_rim_corrected",
     "composite_video_source_removal",
     "composite_video_spatial_recovery",
     "composite_video_temporal_recovery",
